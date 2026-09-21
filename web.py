@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-radtest web felület - csak megjelenítés (tesztet nem indít, nem állít le).
+radtest web UI - read only (never starts or stops a test).
 
   ./web.py [--port 8090] [--bind 0.0.0.0] [--results results]
 
 API:
-  GET  /api/status                 futó teszt állapota, lépések, haladás
-  GET  /api/drives                 minden futás összefoglalója
-  GET  /api/drive?dir=S/N/idő      egy futás részletei
-  GET  /api/latency?dir=..&label=pass1/write   késleltetés idősor (összevonva)
-  GET  /api/log?offset=N           radtest.log új sorai
-  POST /api/report                 összesítő riport újragenerálása
-  GET  /files/<útvonal>            fájl letöltése a results alól
+  GET  /api/status                 state of the running test, steps, progress
+  GET  /api/drives                 summary of every run
+  GET  /api/drive?dir=S/N/time     details of one run
+  GET  /api/latency?dir=..&label=pass1/write   latency time series (bucketed)
+  GET  /api/log?offset=N           new lines of radtest.log
+  POST /api/report                 regenerate the summary report
+  GET  /files/<path>               download a file from under results
 """
 import argparse
 import csv
@@ -44,7 +44,7 @@ STEP_KEYS = [
     ("pass2_verify", "Pass 2: read back & verify"),
     ("final", "Final logs, self-test, evaluation"),
 ]
-# nvblk lépések: (könyvtár/címke, megjelenített név)
+# nvblk steps: (directory/label, display name)
 IO_LABELS = [
     ("pass0/readscan", "Pass 0 read"),
     ("pass1/write", "Pass 1 write"),
@@ -65,7 +65,7 @@ def load(path):
 
 
 def safe_rel(rel):
-    """results alatti útvonal, kilépés nélkül."""
+    """Path under results, without escaping it."""
     p = (RESULTS / rel).resolve()
     if RESULTS.resolve() not in p.parents and p != RESULTS.resolve():
         return None
@@ -86,7 +86,7 @@ def watch_running():
 
 
 # ---------------------------------------------------------------------------
-# késleltetés CSV: növekményes beolvasás, gyorsítótárral
+# latency CSV: incremental read with a cache
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +122,7 @@ class LatCache:
                 for ln in lines:
                     parts = ln.split(b",")
                     if len(parts) < 6 or parts[0] == b"t_s" or parts[3] == b"0":
-                        continue  # fejléc / flush
+                        continue  # header / flush
                     try:
                         t.append(float(parts[0]))
                         lba.append(int(parts[2]))
@@ -177,7 +177,7 @@ def latency_series(run_dir, label, points=600):
 
 
 # ---------------------------------------------------------------------------
-# adatok
+# data
 # ---------------------------------------------------------------------------
 
 
@@ -245,7 +245,7 @@ def current_status():
             out["dir_rel"] = str(d.relative_to(RESULTS))
         except ValueError:
             out["dir_rel"] = None
-        # aktív nvblk lépés: a legutóbb módosult latency fájl
+        # active nvblk step: the most recently modified latency file
         newest, lab = 0, None
         for label, _ in IO_LABELS:
             p = d / f"{label}_latency.csv"
@@ -339,19 +339,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, all_runs())
             if u.path == "/api/drive":
                 d = run_detail(q.get("dir", ""))
-                return self.send(200, d) if d else self.send(404, {"error": "nincs ilyen futás"})
+                return self.send(200, d) if d else self.send(404, {"error": "no such run"})
             if u.path == "/api/latency":
                 d = safe_rel(q.get("dir", ""))
                 label = q.get("label", "")
                 if not d or label not in dict(IO_LABELS):
-                    return self.send(404, {"error": "hibás paraméter"})
+                    return self.send(404, {"error": "bad parameter"})
                 return self.send(200, latency_series(d, label, int(q.get("points", 600))))
             if u.path == "/api/log":
                 return self.send(200, LogTail.read(int(q.get("offset", -1))))
             if u.path.startswith("/files/"):
                 p = safe_rel(urllib.parse.unquote(u.path[len("/files/"):]))
                 if not p or not p.is_file():
-                    return self.send(404, {"error": "nincs ilyen fájl"})
+                    return self.send(404, {"error": "no such file"})
                 ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
                 if p.suffix in (".log", ".txt", ".csv", ".md", ".json", ".err"):
                     ctype = ("text/plain" if p.suffix != ".json" else "application/json") + "; charset=utf-8"
@@ -359,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
                 if q.get("download"):
                     extra["Content-Disposition"] = f'attachment; filename="{p.name}"'
                 return self.send(200, p.read_bytes(), ctype, extra)
-            return self.send(404, {"error": "ismeretlen útvonal"})
+            return self.send(404, {"error": "unknown path"})
         except BrokenPipeError:
             pass
         except Exception as ex:  # noqa: BLE001
@@ -381,12 +381,12 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 sys.stdout = old
             return self.send(200, {"rc": rc, "output": buf.getvalue()})
-        self.send(404, {"error": "ismeretlen útvonal"})
+        self.send(404, {"error": "unknown path"})
 
 
 def main():
     global RESULTS
-    ap = argparse.ArgumentParser(description="radtest web felület")
+    ap = argparse.ArgumentParser(description="radtest web UI")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--results", default=str(ROOT / "results"))
@@ -394,7 +394,7 @@ def main():
     RESULTS = Path(a.results).resolve()
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.daemon_threads = True
-    print(f"radtest web: http://{a.bind}:{a.port}/  (eredmények: {RESULTS})", flush=True)
+    print(f"radtest web: http://{a.bind}:{a.port}/  (results: {RESULTS})", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

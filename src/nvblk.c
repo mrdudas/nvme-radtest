@@ -1,26 +1,26 @@
 /*
- * nvblk - teljes lemezes írás / visszaolvasás / ellenőrzés NVMe passthrough-val
+ * nvblk - full-disk write / read-back / verify via NVMe passthrough
  *
- * Minden blokkba egyedi, determinisztikus minta kerül:
+ * Every block gets a unique, deterministic pattern:
  *   0..7   LBA (LE)          8..15  seed (LE)        16..23 "RADTEST1"
- *   24..   splitmix64 folyam (seed, LBA) alapján
- * Így az ellenőrzésnél megkülönböztethető: olvasási hiba, bithiba, rossz helyre
- * került (misdirected) írás, korábbi menet maradványa (stale), nullázott blokk.
+ *   24..   splitmix64 stream (based on seed, LBA)
+ * This lets verification tell apart: read error, bit error, write that landed in the
+ * wrong place (misdirected), leftover from an earlier pass (stale), zeroed block.
  *
- * Módok:
- *   write       teljes írás (hiba esetén felezéssel blokk szintig lebont)
- *   verify      visszaolvasás és összehasonlítás
- *   erasecheck  törlés utáni olvasás: nem maradhat RADTEST minta
- *   readscan    csak olvasás, tartalom ellenőrzés nélkül (eredeti állapot felmérése)
+ * Modes:
+ *   write       full write (on error, bisection narrows it down to block level)
+ *   verify      read back and compare
+ *   erasecheck  read after erase: no RADTEST pattern may remain
+ *   readscan    read only, without content verification (survey of the original state)
  *
- * Kimenet (--out könyvtár, --label előtaggal):
- *   <label>_errors.csv   hibás tartományok (összevonva)
- *   <label>_latency.csv  minden parancs késleltetése
- *   <label>_slow.csv     kiugró késleltetések
+ * Output (--out directory, prefixed with --label):
+ *   <label>_errors.csv   failed ranges (merged)
+ *   <label>_latency.csv  latency of every command
+ *   <label>_slow.csv     outlier latencies
  *   <label>_progress.json, <label>_summary.json
  *
- * Kilépési kód: 0 hiba nélkül, 1 hibák voltak, 2 használati/indítási hiba,
- *               3 eszköz elveszett / megszakítva
+ * Exit code: 0 no errors, 1 errors occurred, 2 usage/startup error,
+ *            3 device lost / interrupted
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -63,7 +63,7 @@ struct pend {
 struct stcount { int st; uint64_t events, lbas; };
 
 struct ctx {
-	/* opciók */
+	/* options */
 	const char *dev, *outdir, *label, *ctrl_state;
 	enum mode mode;
 	uint64_t seed, start, count;
@@ -80,10 +80,10 @@ struct ctx {
 	unsigned char *buf, *exp, *failmap;
 	FILE *f_err, *f_lat, *f_slow;
 
-	/* számlálók (LBA-ban, ha másképp nincs jelölve) */
+	/* counters (in LBAs unless noted otherwise) */
 	uint64_t io_err_lbas, io_err_events, unbisected_lbas, ctrl_err_events;
 	uint64_t mismatch_lbas, corrupt, bitflips, misdirected, stale, zeroed, ones;
-	uint64_t unwritten_lbas; /* 0x287: deallocated/unwritten (erasecheck-nél nem hiba) */
+	uint64_t unwritten_lbas; /* 0x287: deallocated/unwritten (not an error in erasecheck) */
 	uint64_t erased_ok, foreign;
 	uint64_t slow_cmds, slow_time_us, cmds, bytes_ok, err_rows, rows_dropped;
 	struct stcount stc[MAX_STATUS];
@@ -116,7 +116,7 @@ static double elapsed_s(struct ctx *c)
 	return (t.tv_sec - c->t0.tv_sec) + (t.tv_nsec - c->t0.tv_nsec) / 1e9;
 }
 
-/* ---------- minta ---------- */
+/* ---------- pattern ---------- */
 
 static inline uint64_t splitmix64(uint64_t *s)
 {
@@ -139,7 +139,7 @@ static void fill_block(struct ctx *c, unsigned char *p, uint64_t lba)
 		put64(p + off, splitmix64(&s));
 }
 
-/* ---------- NVMe státusz ---------- */
+/* ---------- NVMe status ---------- */
 
 static const char *status_desc(int st)
 {
@@ -194,21 +194,21 @@ static const char *status_desc(int st)
 		case 0x72: d = "Controller Pathing Error"; break;
 		}
 	}
-	snprintf(b, sizeof b, "SCT%d/SC0x%02x %s%s%s", sct, sc, d ? d : "(ismeretlen)",
+	snprintf(b, sizeof b, "SCT%d/SC0x%02x %s%s%s", sct, sc, d ? d : "(unknown)",
 		 (st & 0x4000) ? " DNR" : "", (st & 0x2000) ? " MORE" : "");
 	return b;
 }
 
-static int st_key(int st) { return st > 0 ? (st & 0x7ff) : st; } /* DNR/MORE nélkül */
+static int st_key(int st) { return st > 0 ? (st & 0x7ff) : st; } /* without DNR/MORE */
 
 static int is_lost(int st) { return st == -ENODEV || st == -ENXIO || st == -ESHUTDOWN; }
 
-/* vezérlő szintű hiba: nincs értelme blokkonként felezni */
+/* controller level error: no point in bisecting block by block */
 static int is_ctrl_err(struct ctx *c, int st)
 {
 	(void)c;
 	if (st < 0)
-		return st != -EIO; /* -EIO: blokk szintű hiba, felezhető */
+		return st != -EIO; /* -EIO: block level error, can be bisected */
 	int sct = (st >> 8) & 7, sc = st & 0xff;
 	if (sct == 3)
 		return 1;
@@ -230,7 +230,7 @@ static void count_status(struct ctx *c, int st, uint64_t lbas)
 		c->stc[c->nstc++] = (struct stcount){ k, 1, lbas };
 }
 
-/* ---------- hibasorok összevonása ---------- */
+/* ---------- merging error rows ---------- */
 
 static const char *op_name(struct ctx *c)
 {
@@ -273,7 +273,7 @@ static void record(struct ctx *c, const char *kind, uint64_t lba, uint64_t n, in
 	p->bits = bits;
 }
 
-/* ---------- késleltetés ---------- */
+/* ---------- latency ---------- */
 
 static int hbucket(uint64_t us)
 {
@@ -314,7 +314,7 @@ static void note_latency(struct ctx *c, const char *op, uint64_t lba, uint32_t n
 	double t = elapsed_s(c);
 	fprintf(c->f_lat, "%.3f,%s,%" PRIu64 ",%u,%" PRIu64 ",0x%04x\n", t, op, lba, n, lat,
 		st > 0 ? st : (st < 0 ? 0xffff : 0));
-	if (!n) { /* flush: külön számoljuk, nem része a lassú I/O statisztikának */
+	if (!n) { /* flush: counted separately, not part of the slow I/O statistics */
 		c->flush_cmds++;
 		if (lat > c->flush_us)
 			c->flush_us = lat;
@@ -354,7 +354,7 @@ static int ctrl_live(struct ctx *c)
 	char s[32] = "";
 	FILE *f = fopen(c->ctrl_state, "r");
 	if (!f)
-		return -1; /* eltűnt */
+		return -1; /* gone */
 	if (!fgets(s, sizeof s, f))
 		s[0] = 0;
 	fclose(f);
@@ -365,7 +365,7 @@ static int ctrl_live(struct ctx *c)
 	return 0;
 }
 
-/* vezérlőhiba után megvárjuk, míg újra él; 0 ha él, -1 ha elveszett */
+/* after a controller error we wait until it is alive again; 0 if alive, -1 if lost */
 static int wait_ctrl(struct ctx *c)
 {
 	uint64_t t0 = now_us();
@@ -431,8 +431,8 @@ static int do_flush(struct ctx *c)
 }
 
 /*
- * Tartomány írása/olvasása; hiba esetén felezés blokk szintig.
- * base: a darab kezdő LBA-ja (a buf ehhez igazodik). Visszatér: hibás LBA-k száma.
+ * Write/read a range; on error, bisect down to block level.
+ * base: the starting LBA of the chunk (buf is aligned to it). Returns: number of failed LBAs.
  */
 static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uint32_t n)
 {
@@ -445,13 +445,13 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 	if (is_lost(st) || g_stop) {
 		if (is_lost(st)) {
 			c->device_lost = 1;
-			snprintf(c->abort_reason, sizeof c->abort_reason, "eszköz elveszett: %s", status_desc(st));
+			snprintf(c->abort_reason, sizeof c->abort_reason, "device lost: %s", status_desc(st));
 		}
 		return 0;
 	}
 	int sct = st > 0 ? (st >> 8) & 7 : -1, sc = st > 0 ? st & 0xff : -1;
 	if ((c->mode == M_ERASECHECK || c->mode == M_READSCAN) && sct == 2 && sc == 0x87) {
-		/* deallocated/unwritten: törlés után / üres lemezen ez elvárt viselkedés */
+		/* deallocated/unwritten: after an erase / on an empty disk this is expected behavior */
 		c->unwritten_lbas += n;
 		c->erased_ok += n;
 		count_status(c, st, n);
@@ -465,16 +465,16 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 		if (wait_ctrl(c) < 0) {
 			c->device_lost = 1;
 			snprintf(c->abort_reason, sizeof c->abort_reason,
-				 "vezérlő nem tért vissza hiba után: %s", status_desc(st));
+				 "controller did not come back after error: %s", status_desc(st));
 			return 0;
 		}
 		if (c->consec_ctrl > MAX_CONSEC_CTRL_ERRORS) {
 			c->device_lost = 1;
 			snprintf(c->abort_reason, sizeof c->abort_reason,
-				 "túl sok egymást követő vezérlőhiba (%d)", c->consec_ctrl);
+				 "too many consecutive controller errors (%d)", c->consec_ctrl);
 			return 0;
 		}
-		/* egy újrapróbálás; ha az is vezérlőhiba, a tartományt egészben rögzítjük */
+		/* one retry; if that is a controller error too, we record the whole range */
 		st = do_io(c, wr, lba, n, b);
 		if (st == 0) {
 			c->consec_ctrl = 0;
@@ -483,7 +483,7 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 		}
 		if (is_lost(st)) {
 			c->device_lost = 1;
-			snprintf(c->abort_reason, sizeof c->abort_reason, "eszköz elveszett: %s", status_desc(st));
+			snprintf(c->abort_reason, sizeof c->abort_reason, "device lost: %s", status_desc(st));
 			return 0;
 		}
 		if (is_ctrl_err(c, st)) {
@@ -493,7 +493,7 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 			if (wait_ctrl(c) < 0) {
 				c->device_lost = 1;
 				snprintf(c->abort_reason, sizeof c->abort_reason,
-					 "vezérlő nem tért vissza hiba után: %s", status_desc(st));
+					 "controller did not come back after error: %s", status_desc(st));
 				return 0;
 			}
 			record(c, "ctrl_error", lba, n, st, 0, 0);
@@ -501,7 +501,7 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 			memset(c->failmap + (lba - base), 1, n);
 			return n;
 		}
-		/* nem vezérlőhiba lett belőle: mehet a normál ág */
+		/* it turned into a non-controller error: continue on the normal path */
 	}
 	if (n == 1 || c->bisect_off) {
 		c->io_err_events++;
@@ -541,7 +541,7 @@ static void check_chunk(struct ctx *c, uint64_t base, uint32_t n)
 {
 	for (uint32_t i = 0; i < n; i++) {
 		if (c->failmap[i])
-			continue; /* olvasási hiba vagy unwritten: már számolva */
+			continue; /* read error or unwritten: already counted */
 		uint64_t lba = base + i;
 		unsigned char *got = c->buf + (uint64_t)i * c->lbs;
 		int has_magic = !memcmp(got + 16, MAGIC, 8);
@@ -552,7 +552,7 @@ static void check_chunk(struct ctx *c, uint64_t base, uint32_t n)
 				c->erased_ok++;
 				continue;
 			}
-			/* a törlés után is ott maradt egy korábbi menet mintája */
+			/* the pattern of an earlier pass survived the erase */
 			c->stale++;
 			c->mismatch_lbas++;
 			record(c, glba == lba ? "stale_after_erase" : "stale_after_erase_misplaced", lba, 1, 0,
@@ -585,7 +585,7 @@ static void check_chunk(struct ctx *c, uint64_t base, uint32_t n)
 	}
 }
 
-/* ---------- riport ---------- */
+/* ---------- report ---------- */
 
 static FILE *open_out(struct ctx *c, const char *suffix, const char *mode)
 {
@@ -593,7 +593,7 @@ static FILE *open_out(struct ctx *c, const char *suffix, const char *mode)
 	snprintf(p, sizeof p, "%s/%s_%s", c->outdir, c->label, suffix);
 	FILE *f = fopen(p, mode);
 	if (!f) {
-		fprintf(stderr, "nem nyitható: %s: %s\n", p, strerror(errno));
+		fprintf(stderr, "cannot open: %s: %s\n", p, strerror(errno));
 		exit(2);
 	}
 	return f;
@@ -690,7 +690,7 @@ static void summary(struct ctx *c, const char *result)
 	free(s);
 }
 
-/* ---------- beállítás ---------- */
+/* ---------- setup ---------- */
 
 static unsigned long read_sysfs_ul(dev_t rdev, const char *attr)
 {
@@ -709,18 +709,18 @@ static unsigned long read_sysfs_ul(dev_t rdev, const char *attr)
 static void usage(void)
 {
 	fprintf(stderr,
-		"használat: nvblk --mode write|verify|erasecheck|readscan --dev /dev/nvmeXnY --out DIR --label NÉV\n"
-		"  --seed N          minta seed (verify-nál ugyanaz kell, mint write-nál)\n"
-		"  --ctrl-state F    pl. /sys/class/nvme/nvme0/state (vezérlő reset figyelése)\n"
-		"  --chunk-kb N      darabméret (alap 1024, eszközkorláthoz igazítva)\n"
-		"  --timeout-ms N    parancs időkorlát (alap 60000)\n"
-		"  --ctrl-wait N     vezérlő újraélesztésére várás mp (alap 180)\n"
-		"  --slow-factor X   lassúnak számít, ha > X * alapszint (alap 10)\n"
-		"  --slow-min-ms N   ennél rövidebb sosem lassú (alap 20)\n"
-		"  --slow-abs-ms N   bemelegedés alatt abszolút küszöb (alap 500)\n"
-		"  --start LBA --count N   részleges futás\n"
-		"  --max-err-rows N  errors.csv sorkorlát (alap 2000000)\n"
-		"  --posix           O_DIRECT pread/pwrite passthrough helyett (teszthez)\n");
+		"usage: nvblk --mode write|verify|erasecheck|readscan --dev /dev/nvmeXnY --out DIR --label NAME\n"
+		"  --seed N          pattern seed (verify needs the same one as write)\n"
+		"  --ctrl-state F    e.g. /sys/class/nvme/nvme0/state (watch for controller reset)\n"
+		"  --chunk-kb N      chunk size (default 1024, clamped to the device limit)\n"
+		"  --timeout-ms N    command timeout (default 60000)\n"
+		"  --ctrl-wait N     seconds to wait for the controller to come back (default 180)\n"
+		"  --slow-factor X   counts as slow if > X * baseline (default 10)\n"
+		"  --slow-min-ms N   anything shorter is never slow (default 20)\n"
+		"  --slow-abs-ms N   absolute threshold during warm-up (default 500)\n"
+		"  --start LBA --count N   partial run\n"
+		"  --max-err-rows N  errors.csv row limit (default 2000000)\n"
+		"  --posix           O_DIRECT pread/pwrite instead of passthrough (for testing)\n");
 	exit(2);
 }
 
@@ -786,31 +786,31 @@ int main(int argc, char **argv)
 	}
 	struct stat sb;
 	if (fstat(c.fd, &sb) || !S_ISBLK(sb.st_mode)) {
-		fprintf(stderr, "%s nem blokkeszköz\n", c.dev);
+		fprintf(stderr, "%s is not a block device\n", c.dev);
 		return 2;
 	}
 	uint64_t bytes;
 	int ssz;
 	if (ioctl(c.fd, BLKGETSIZE64, &bytes) || ioctl(c.fd, BLKSSZGET, &ssz)) {
-		fprintf(stderr, "méret lekérdezése sikertelen: %s\n", strerror(errno));
+		fprintf(stderr, "size query failed: %s\n", strerror(errno));
 		return 2;
 	}
 	c.lbs = (uint32_t)ssz;
 	c.nlba = bytes / c.lbs;
 	if (c.lbs < 512 || c.lbs % 8) {
-		fprintf(stderr, "nem támogatott blokkméret: %u\n", c.lbs);
+		fprintf(stderr, "unsupported block size: %u\n", c.lbs);
 		return 2;
 	}
 	if (!c.posix) {
 		int ns = ioctl(c.fd, NVME_IOCTL_ID);
 		if (ns <= 0) {
-			fprintf(stderr, "NVME_IOCTL_ID sikertelen (%s) - nem NVMe? (--posix)\n", strerror(errno));
+			fprintf(stderr, "NVME_IOCTL_ID failed (%s) - not NVMe? (--posix)\n", strerror(errno));
 			return 2;
 		}
 		c.nsid = (uint32_t)ns;
 	}
 
-	/* darabméret: kérés, max_hw_sectors_kb, max_segments*4K, 65536 LBA közül a legkisebb */
+	/* chunk size: the smallest of request, max_hw_sectors_kb, max_segments*4K, 65536 LBA */
 	uint64_t ckb = c.chunk_kb ? c.chunk_kb : 1024;
 	unsigned long mhw = read_sysfs_ul(sb.st_rdev, "max_hw_sectors_kb");
 	unsigned long mseg = read_sysfs_ul(sb.st_rdev, "max_segments");
@@ -826,7 +826,7 @@ int main(int argc, char **argv)
 	c.chunk = (uint32_t)cl;
 
 	if (c.start >= c.nlba) {
-		fprintf(stderr, "start a névtéren kívül\n");
+		fprintf(stderr, "start is outside the namespace\n");
 		return 2;
 	}
 	c.end = c.count ? c.start + c.count : c.nlba;
@@ -835,7 +835,7 @@ int main(int argc, char **argv)
 
 	if (posix_memalign((void **)&c.buf, 4096, (size_t)c.chunk * c.lbs) ||
 	    posix_memalign((void **)&c.exp, 4096, c.lbs) || !(c.failmap = malloc(c.chunk))) {
-		fprintf(stderr, "memória\n");
+		fprintf(stderr, "out of memory\n");
 		return 2;
 	}
 	memset(c.buf, 0, (size_t)c.chunk * c.lbs);
@@ -871,7 +871,7 @@ int main(int argc, char **argv)
 		if (failed == n) {
 			if (++c.consec_failed_chunks >= MAX_CONSEC_FAILED_CHUNKS && !c.bisect_off) {
 				c.bisect_off = 1;
-				fprintf(stderr, "\n%d egymást követő teljesen hibás darab: felezés szünetel\n",
+				fprintf(stderr, "\n%d consecutive fully failed chunks: bisection paused\n",
 					c.consec_failed_chunks);
 			}
 		} else if (failed == 0) {
@@ -904,7 +904,7 @@ int main(int argc, char **argv)
 		rc = 3;
 	} else if (g_stop) {
 		result = "interrupted";
-		snprintf(c.abort_reason, sizeof c.abort_reason, "megszakítva (signal)");
+		snprintf(c.abort_reason, sizeof c.abort_reason, "interrupted (signal)");
 		rc = 3;
 	} else if (c.io_err_lbas || c.unbisected_lbas || c.mismatch_lbas || c.ctrl_err_events || c.rows_dropped) {
 		result = "errors";
@@ -917,8 +917,8 @@ int main(int argc, char **argv)
 	fclose(c.f_err);
 	fclose(c.f_lat);
 	fclose(c.f_slow);
-	fprintf(stderr, "\nnvblk %s kész: %s (hibás LBA: %" PRIu64 ", eltérés: %" PRIu64 ", vezérlőhiba: %" PRIu64
-		", lassú: %" PRIu64 ")\n", mode_name(c.mode), result, c.io_err_lbas + c.unbisected_lbas,
+	fprintf(stderr, "\nnvblk %s done: %s (bad LBAs: %" PRIu64 ", mismatches: %" PRIu64 ", controller errors: %" PRIu64
+		", slow: %" PRIu64 ")\n", mode_name(c.mode), result, c.io_err_lbas + c.unbisected_lbas,
 		c.mismatch_lbas, c.ctrl_err_events, c.slow_cmds);
 	return rc;
 }

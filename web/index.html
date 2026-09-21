@@ -239,9 +239,9 @@ const VTEXT = { OK: "Healthy", SUSPECT: "Suspect (tests clean, but warning signs
   LOGICAL: "Software/logical damage (errors gone after erase)", PHYSICAL: "Physical damage",
   DEAD: "Not working / lost during test", INCOMPLETE: "Incomplete test" };
 const verdictPill = v => `<span class="pill ${VCLS[v] || ""}"><span class="dot"></span>${esc(VSHORT[v] || v || "?")}</span>`;
-const ERASE = { "nem támogatott": "not supported", "kihagyva": "skipped", "SIKERTELEN": "FAILED",
-  "sanitize-block": "sanitize (block erase)", "sanitize-crypto": "sanitize (crypto erase)",
-  "format-ses1": "format (user data erase)", "format-ses0": "format" };
+const ERASE = { "sanitize-block": "sanitize (block erase)", "sanitize-crypto": "sanitize (crypto erase)",
+  "format-ses1": "format (user data erase)", "format-ses0": "format",
+  "nem támogatott": "not supported", "kihagyva": "skipped", "SIKERTELEN": "FAILED" };  // last three: legacy results
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 // ---------- theme ----------
@@ -429,7 +429,8 @@ async function refreshLog() {
   if (!r.lines.length) return;
   const el = $("#log");
   const html = r.lines.map(l => {
-    const cls = /HIBA:/.test(l) ? "e" : /FIGYELEM:/.test(l) ? "w" : /(KÉSZ|kész: clean|hiba nélkül|kivehető|eltávolítva)/.test(l) ? "o" : "";
+    const cls = /(ERROR|HIBA):/.test(l) ? "e" : /(WARNING|FIGYELEM):/.test(l) ? "w"
+      : /(DONE|KÉSZ|: clean|without error|can be removed|removed\.|kivehető|eltávolítva)/.test(l) ? "o" : "";
     return `<div class="${cls}">${esc(l)}</div>`; }).join("");
   if (first) el.innerHTML = html; else el.insertAdjacentHTML("beforeend", html);
   while (el.childElementCount > 3000) el.firstElementChild.remove();
@@ -499,7 +500,7 @@ async function showDrive(dir) {
         <span><i style="background:var(--bad)"></i>failed command</span><span>dashed: slow threshold (20 ms)</span></div>
       <div id="ddSlow" style="margin-top:10px"></div>
     </div>
-    <div class="card"><h2>Summary (summary.txt, Hungarian)</h2><pre class="text">${esc(d.text)}</pre></div>
+    <div class="card"><h2>Summary (summary.txt)</h2><pre class="text">${esc(d.text)}</pre></div>
     <div class="card"><h2>Files</h2><div class="files">
       ${d.files.map(f => `<a href="/files/${encodeURI(f.path)}" target="_blank">${esc(f.name)} <span class="muted">(${f.size > 1e6 ? (f.size / 1e6).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " KB"})</span></a>`).join("")}
     </div></div>`;
@@ -526,7 +527,7 @@ async function loadReport(regen) {
     $("#reportBtn").disabled = false; $("#reportBtn").textContent = "Regenerate report"; }
   try {
     const r = await fetch("/files/REPORT.txt");
-    $("#reportText").textContent = r.ok ? await r.text() : "No report yet – click “Regenerate report”. (The report files are in Hungarian.)";
+    $("#reportText").textContent = r.ok ? await r.text() : "No report yet – click “Regenerate report”.";
   } catch (e) {}
   try {
     const rows = await api("/api/drives"), latest = {};
