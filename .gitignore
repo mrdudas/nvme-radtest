@@ -1,0 +1,9 @@
+# mérési eredmények (nagy, gépenként külön)
+results/
+# fordítási eredmény
+bin/
+__pycache__/
+*.pyc
+# futó folyamatok kimenete / pid fájlok
+*.out
+.*.pid

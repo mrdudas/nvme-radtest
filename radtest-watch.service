@@ -1,0 +1,19 @@
+[Unit]
+Description=radtest NVMe hot-plug watcher (post-irradiation testing)
+After=local-fs.target
+ConditionPathExists=/root/nvme-radtest/bin/nvblk
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nvme-radtest
+# --yes: szolgáltatásként nincs kivel megerősíttetni a törlést
+ExecStart=/usr/bin/python3 /root/nvme-radtest/radtest.py watch --yes
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=300
+StandardOutput=append:/root/nvme-radtest/results_watch.out
+StandardError=append:/root/nvme-radtest/results_watch.out
+
+[Install]
+WantedBy=multi-user.target

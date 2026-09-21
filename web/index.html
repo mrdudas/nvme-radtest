@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radtest – NVMe inspection</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☢️</text></svg>">
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --panel2: #f0f2f5; --line: #dde1e7;
+  --text: #1b1f24; --muted: #667080; --accent: #2f6fde; --accent-soft: #dbe6fb;
+  --ok: #1f8a4c; --ok-soft: #dcf3e5; --warn: #b7791f; --warn-soft: #fbefd9;
+  --bad: #c9362b; --bad-soft: #fbe1de; --dead: #5b2a86; --dead-soft: #ece1f5;
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --shadow: 0 1px 2px rgba(20,30,50,.06), 0 2px 8px rgba(20,30,50,.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a303a;
+    --text: #e3e7ed; --muted: #8b95a5; --accent: #6a9cff; --accent-soft: #1d2b47;
+    --ok: #4cc27f; --ok-soft: #173325; --warn: #e0a84a; --warn-soft: #3a2d15;
+    --bad: #f0685c; --bad-soft: #3d1c1a; --dead: #b88ae6; --dead-soft: #2d2140;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a303a;
+  --text: #e3e7ed; --muted: #8b95a5; --accent: #6a9cff; --accent-soft: #1d2b47;
+  --ok: #4cc27f; --ok-soft: #173325; --warn: #e0a84a; --warn-soft: #3a2d15;
+  --bad: #f0685c; --bad-soft: #3d1c1a; --dead: #b88ae6; --dead-soft: #2d2140;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 16px; padding: 10px 20px; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+header h1 span { color: var(--muted); font-weight: 400; }
+nav { display: flex; gap: 4px; }
+nav a { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; font-weight: 500; }
+nav a.active { background: var(--accent-soft); color: var(--accent); }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.pill.dead { background: var(--dead-soft); color: var(--dead); }
+.pill.run { background: var(--accent-soft); color: var(--accent); }
+.pill.run .dot { animation: pulse 1.4s infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+button, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  padding: 6px 12px; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; }
+button:hover, .btn:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+main { max-width: 1400px; margin: 0 auto; padding: 20px; }
+.grid { display: grid; gap: 16px; }
+.cols-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.cols-main { grid-template-columns: 320px minmax(0, 1fr); }
+@media (max-width: 1000px) { .cols-2, .cols-main { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+  box-shadow: var(--shadow); min-width: 0; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+  margin: 0 0 12px; font-weight: 600; }
+.card h3 { margin: 0 0 4px; font-size: 18px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.stat { background: var(--panel2); border-radius: 8px; padding: 10px 12px; }
+.stat .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stat .l { font-size: 12px; color: var(--muted); }
+.stat.bad { background: var(--bad-soft); } .stat.bad .v { color: var(--bad); }
+.stat.warn { background: var(--warn-soft); } .stat.warn .v { color: var(--warn); }
+.steps { list-style: none; margin: 0; padding: 0; }
+.steps li { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--line); }
+.steps li:last-child { border-bottom: 0; }
+.steps .ic { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  font-size: 11px; font-weight: 700; background: var(--panel2); color: var(--muted); }
+.steps li.done .ic { background: var(--ok-soft); color: var(--ok); }
+.steps li.running .ic { background: var(--accent); color: #fff; animation: pulse 1.4s infinite; }
+.steps li.running { font-weight: 600; }
+.steps li.pending { color: var(--muted); }
+.steps .d { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar { height: 14px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .6s; }
+.progress-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; gap: 12px; flex-wrap: wrap; }
+.progress-head .pct { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.chart-wrap { position: relative; }
+canvas.chart { width: 100%; height: 240px; display: block; }
+.tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: var(--mono); box-shadow: var(--shadow);
+  display: none; white-space: nowrap; z-index: 3; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+.log { background: var(--panel2); border-radius: 8px; font-family: var(--mono); font-size: 12px;
+  height: 340px; overflow: auto; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+.log .e { color: var(--bad); } .log .w { color: var(--warn); } .log .o { color: var(--ok); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.nz { color: var(--bad); font-weight: 650; }
+tbody tr.click { cursor: pointer; } tbody tr.click:hover { background: var(--panel2); }
+.scroll-x { overflow-x: auto; }
+pre.text { background: var(--panel2); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 12px;
+  overflow: auto; max-height: 70vh; margin: 0; }
+.reasons { margin: 8px 0 0; padding-left: 18px; }
+.reasons li { margin: 3px 0; }
+.reasons li.physical, .reasons li.logical, .reasons li.abort { color: var(--bad); }
+.reasons li.suspect { color: var(--warn); }
+.idle { text-align: center; padding: 50px 20px; }
+.idle .big { font-size: 22px; font-weight: 650; margin: 10px 0; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.tabs button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.files { columns: 3 260px; font-size: 12px; font-family: var(--mono); }
+.files a { color: var(--accent); text-decoration: none; display: block; padding: 1px 0; break-inside: avoid; }
+.hidden { display: none !important; }
+#driveDetail { scroll-margin-top: 70px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+@media (max-width: 600px) { main { padding: 12px 16px; } header { padding: 10px 16px; } .progress-head .pct { font-size: 26px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>☢️ radtest <span>post-irradiation NVMe inspection</span></h1>
+  <nav>
+    <a href="#live" data-tab="live">Live test</a>
+    <a href="#drives" data-tab="drives">Drives</a>
+    <a href="#report" data-tab="report">Report</a>
+  </nav>
+  <div class="spacer"></div>
+  <span id="watchPill" class="pill"><span class="dot"></span><span>…</span></span>
+  <span id="clock" class="muted mono"></span>
+  <button id="themeBtn" title="Toggle theme">◐</button>
+</header>
+
+<main>
+  <!-- LIVE -->
+  <section id="tab-live">
+    <div id="liveIdle" class="card idle hidden">
+      <div style="font-size:42px">💤</div>
+      <div class="big" id="idleTitle">No test running</div>
+      <div class="muted" id="idleSub"></div>
+      <div id="idleLast" style="margin-top:16px"></div>
+    </div>
+    <div id="liveRun" class="grid cols-main hidden">
+      <div class="grid" style="align-content:start">
+        <div class="card">
+          <h2>Drive</h2>
+          <h3 id="dModel">–</h3>
+          <div class="muted mono" id="dSerial"></div>
+          <dl class="kv" style="margin-top:12px" id="dKv"></dl>
+        </div>
+        <div class="card">
+          <h2>Steps</h2>
+          <ul class="steps" id="steps"></ul>
+        </div>
+      </div>
+      <div class="grid" style="align-content:start">
+        <div class="card">
+          <div class="progress-head">
+            <div>
+              <h2 style="margin:0">Current step</h2>
+              <div style="font-size:17px;font-weight:600" id="curStep">–</div>
+            </div>
+            <div class="pct" id="curPct"></div>
+          </div>
+          <div class="bar"><div id="curBar" style="width:0"></div></div>
+          <div class="row muted" style="margin-top:8px;justify-content:space-between" id="curMeta"></div>
+          <div class="stats" style="margin-top:14px" id="curStats"></div>
+        </div>
+        <div class="card" id="liveChartCard">
+          <h2 id="liveChartTitle">Latency</h2>
+          <div class="chart-wrap"><canvas class="chart" id="liveChart"></canvas><div class="tip"></div></div>
+          <div class="legend"><span><i style="background:var(--accent)"></i>mean</span>
+            <span><i style="background:var(--warn)"></i>maximum</span>
+            <span><i style="background:var(--bad)"></i>failed command</span>
+            <span class="muted">log scale · x: elapsed time</span></div>
+        </div>
+        <div class="card">
+          <h2>Completed read/write steps</h2>
+          <div class="scroll-x"><table id="ioDone"></table></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="row" style="justify-content:space-between"><h2 style="margin:0">Log</h2>
+        <label class="muted"><input type="checkbox" id="autoscroll" checked> auto-scroll</label></div>
+      <div class="log" id="log" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- DRIVES -->
+  <section id="tab-drives" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <h2 style="margin:0">Tested drives</h2>
+        <span class="muted" id="drivesCount"></span>
+      </div>
+      <div class="scroll-x"><table id="drivesTable"></table></div>
+    </div>
+    <div id="driveDetail" class="grid hidden" style="margin-top:16px"></div>
+  </section>
+
+  <!-- REPORT -->
+  <section id="tab-report" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">Summary report</h2>
+        <div class="row">
+          <button class="primary" id="reportBtn">Regenerate report</button>
+          <a class="btn" href="/files/REPORT.txt?download=1">REPORT.txt</a>
+          <a class="btn" href="/files/REPORT.md?download=1">REPORT.md</a>
+          <a class="btn" href="/files/REPORT.csv?download=1">REPORT.csv</a>
+        </div>
+      </div>
+      <div class="stats" style="margin:14px 0" id="reportStats"></div>
+      <pre class="text" id="reportText">…</pre>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const api = async (p, opt) => { const r = await fetch(p, opt); if (!r.ok) throw new Error(p + " " + r.status); return r.json(); };
+const fmtDur = s => { if (s == null || s < 0) return "–"; s = Math.round(s);
+  return `${Math.floor(s / 3600)}:${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
+const gb = b => (b / 1e9).toFixed(1);
+const ms = us => us == null ? "–" : (us / 1000 >= 100 ? (us / 1000).toFixed(0) : (us / 1000).toFixed(2));
+const VCLS = { OK: "ok", SUSPECT: "warn", LOGICAL: "bad", PHYSICAL: "bad", DEAD: "dead", INCOMPLETE: "warn" };
+const VSHORT = { OK: "HEALTHY", SUSPECT: "SUSPECT", LOGICAL: "LOGICAL", PHYSICAL: "PHYSICAL", DEAD: "DEAD", INCOMPLETE: "INCOMPLETE" };
+const VTEXT = { OK: "Healthy", SUSPECT: "Suspect (tests clean, but warning signs present)",
+  LOGICAL: "Software/logical damage (errors gone after erase)", PHYSICAL: "Physical damage",
+  DEAD: "Not working / lost during test", INCOMPLETE: "Incomplete test" };
+const verdictPill = v => `<span class="pill ${VCLS[v] || ""}"><span class="dot"></span>${esc(VSHORT[v] || v || "?")}</span>`;
+const ERASE = { "nem támogatott": "not supported", "kihagyva": "skipped", "SIKERTELEN": "FAILED",
+  "sanitize-block": "sanitize (block erase)", "sanitize-crypto": "sanitize (crypto erase)",
+  "format-ses1": "format (user data erase)", "format-ses0": "format" };
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+// ---------- theme ----------
+try { const t = localStorage.getItem("radtest-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+$("#themeBtn").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const nxt = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = nxt;
+  try { localStorage.setItem("radtest-theme", nxt); } catch (e) {}
+  redrawCharts();
+};
+
+// ---------- tabs ----------
+let tab = "live";
+function route() {
+  const h = location.hash.slice(1) || "live";
+  const [t, arg] = h.split("=");
+  tab = ["live", "drives", "report"].includes(t) ? t : (t === "drive" ? "drives" : "live");
+  for (const s of ["live", "drives", "report"]) $("#tab-" + s).classList.toggle("hidden", s !== tab);
+  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active", a.dataset.tab === tab));
+  if (tab === "drives") { loadDrives(); if (t === "drive" && arg) showDrive(decodeURIComponent(arg)); else $("#driveDetail").classList.add("hidden"); }
+  if (tab === "report") loadReport(false);
+  if (tab === "live") redrawCharts();
+}
+addEventListener("hashchange", route);
+
+// ---------- chart ----------
+const charts = new Map();
+function drawChart(canvas, data, opts = {}) {
+  charts.set(canvas, { data, opts });
+  const dpr = devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const g = canvas.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  const B = (data && data.buckets) || [];
+  const L = 52, R = 10, T = 10, Bm = 26, pw = W - L - R, ph = H - T - Bm;
+  g.font = "11px system-ui"; g.fillStyle = css("--muted"); g.strokeStyle = css("--line"); g.lineWidth = 1;
+  if (!B.length) { g.fillText("no data", L + 8, T + 20); return; }
+  const t0 = B[0].t, t1 = Math.max(B[B.length - 1].t, t0 + 1);
+  let lo = Infinity, hi = 0;
+  for (const b of B) { lo = Math.min(lo, b.mean); hi = Math.max(hi, b.max); }
+  if (opts.slowMin) hi = Math.max(hi, opts.slowMin * 1.5);
+  lo = Math.max(10, Math.pow(10, Math.floor(Math.log10(Math.max(lo, 10)))));
+  hi = Math.pow(10, Math.ceil(Math.log10(Math.max(hi, lo * 10))));
+  const X = t => L + (t - t0) / (t1 - t0) * pw;
+  const Y = v => T + ph - (Math.log10(Math.max(v, lo)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo)) * ph;
+  // grid
+  for (let v = lo; v <= hi; v *= 10) {
+    const y = Y(v); g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+    const lab = v >= 1e6 ? (v / 1e6) + " s" : v >= 1000 ? (v / 1000) + " ms" : v + " µs";
+    g.textAlign = "right"; g.fillText(lab, L - 6, y + 4);
+  }
+  g.textAlign = "center";
+  for (let i = 0; i <= 5; i++) { const t = t0 + (t1 - t0) * i / 5; g.fillText(fmtDur(t), X(t), H - 8); }
+  // slow threshold
+  if (opts.slowMin) { g.setLineDash([4, 4]); g.strokeStyle = css("--warn"); const y = Y(opts.slowMin);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke(); g.setLineDash([]); }
+  const line = (key, color, w) => { g.strokeStyle = color; g.lineWidth = w; g.beginPath();
+    B.forEach((b, i) => { const x = X(b.t), y = Y(b[key]); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); };
+  g.globalAlpha = 0.45; line("max", css("--warn"), 1); g.globalAlpha = 1;
+  line("mean", css("--accent"), 1.8);
+  g.fillStyle = css("--bad");
+  for (const b of B) if (b.err) { g.beginPath(); g.arc(X(b.t), Y(b.max), 3.5, 0, 7); g.fill(); }
+  canvas._geom = { B, X, L, pw };
+}
+function redrawCharts() { for (const [c, v] of charts) drawChart(c, v.data, v.opts); }
+addEventListener("resize", redrawCharts);
+document.addEventListener("mousemove", ev => {
+  const c = ev.target.closest && ev.target.closest("canvas.chart");
+  document.querySelectorAll(".tip").forEach(t => { if (!c || t.previousElementSibling !== c) t.style.display = "none"; });
+  if (!c || !c._geom) return;
+  const { B, X, L, pw } = c._geom, r = c.getBoundingClientRect(), mx = ev.clientX - r.left;
+  if (mx < L || mx > L + pw) return;
+  let best = B[0], bd = Infinity;
+  for (const b of B) { const d = Math.abs(X(b.t) - mx); if (d < bd) { bd = d; best = b; } }
+  const tip = c.nextElementSibling;
+  tip.innerHTML = `t=${fmtDur(best.t)} · ${best.n} commands<br>mean ${ms(best.mean)} ms · max ${ms(best.max)} ms` +
+    `<br>LBA ${best.lba}${best.err ? `<br><b style="color:var(--bad)">${best.err} failed</b>` : ""}`;
+  tip.style.display = "block";
+  tip.style.left = Math.min(mx + 12, r.width - tip.offsetWidth - 4) + "px"; tip.style.top = "10px";
+});
+
+// ---------- live view ----------
+let lastIoLabel = null, lastDirRel = null, lastLatFetch = 0, lastIdleFetch = 0;
+function statBox(v, l, cls = "") { return `<div class="stat ${cls}"><div class="v">${v}</div><div class="l">${l}</div></div>`; }
+
+async function refreshStatus() {
+  let s;
+  try { s = await api("/api/status"); } catch (e) { $("#watchPill").className = "pill bad"; $("#watchPill span:last-child").textContent = "server unreachable"; return; }
+  $("#clock").textContent = s.now.slice(11, 19);
+  const st = s.status || {};
+  const wp = $("#watchPill");
+  if (st.running) { wp.className = "pill run"; wp.lastElementChild.textContent = "test running"; }
+  else if (s.watch_running) { wp.className = "pill ok"; wp.lastElementChild.textContent = "watcher active – waiting for drive"; }
+  else { wp.className = "pill warn"; wp.lastElementChild.textContent = "watcher not running"; }
+  document.title = st.running && st.progress && st.progress.pct != null
+    ? `${st.progress.pct.toFixed(0)}% · radtest` : "radtest – NVMe inspection";
+
+  const running = !!(st.running && s.steps);
+  $("#liveIdle").classList.toggle("hidden", running);
+  $("#liveRun").classList.toggle("hidden", !running);
+  if (!running) {
+    $("#idleTitle").textContent = s.watch_running ? "Waiting for the next drive" : "No test running";
+    $("#idleSub").textContent = s.watch_running ? "Insert the next NVMe drive – the test starts automatically."
+      : "The watcher is not running. Start it with: ./radtest.py watch";
+    if (Date.now() - lastIdleFetch > 15000) {
+      lastIdleFetch = Date.now();
+      try {
+        const rows = await api("/api/drives"), r = rows[0];
+        $("#idleLast").innerHTML = r ? `<span class="muted">Last test:</span> <a href="#drive=${encodeURIComponent(r.dir)}">${esc(r.model)} · ${esc(r.serial)}</a>
+          ${verdictPill(r.verdict)} <span class="muted">${esc((r.started || "").replace("T", " ").slice(0, 16))}</span>
+          <div><ul class="reasons" style="display:inline-block;text-align:left;max-width:900px">${(r.reasons || []).slice(0, 4).map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : "";
+      } catch (e) {}
+    }
+    return;
+  }
+  const id = s.identity || {}, sm = s.smart_pre || {}, pc = s.pcie || {};
+  $("#dModel").textContent = id.model || st.model || "–";
+  $("#dSerial").textContent = "S/N " + (id.serial || st.serial || "–");
+  const kv = [["Controller", st.ctrl], ["Firmware", id.firmware], ["Capacity", id.capacity_bytes ? gb(id.capacity_bytes) + " GB" : null],
+    ["VID", id.vid != null ? "0x" + id.vid.toString(16).padStart(4, "0") : null],
+    ["PCIe", pc.bdf ? `${pc.current_link_speed} x${pc.current_link_width}` : null],
+    ["Power-on hours", sm.power_on_hours], ["Power cycles", sm.power_cycles], ["Unsafe shutdowns", sm.unsafe_shutdowns],
+    ["Media errors", sm.media_errors], ["Error log entries", sm.num_err_log_entries],
+    ["Available spare", sm.avail_spare != null ? `${sm.avail_spare}% (threshold ${sm.spare_thresh}%)` : null],
+    ["Wear", sm.percent_used != null ? sm.percent_used + "%" : null],
+    ["Temperature", sm.temperature_c != null ? sm.temperature_c + " °C" : null],
+    ["Started", (st.started || "").replace("T", " ")]];
+  $("#dKv").innerHTML = kv.filter(x => x[1] != null && x[1] !== "").map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
+  $("#steps").innerHTML = s.steps.map(x => `<li class="${x.state}"><span class="ic">${x.state === "done" ? "✓" : x.n}</span>
+    <span>${esc(x.name)}</span><span class="d">${x.duration_s != null ? fmtDur(x.duration_s) : ""}</span></li>`).join("");
+
+  const p = st.progress;
+  const curN = parseInt(st.step) || 0, curS = s.steps.find(x => x.n === curN);
+  $("#curStep").textContent = `${curN}/${s.steps.length} · ${curS ? curS.name : ""}`;
+  if (p && p.done_lbas != null) {
+    const bad = p.io_err_lbas + p.unbisected_lbas;
+    $("#curPct").textContent = p.pct.toFixed(1) + "%";
+    $("#curBar").style.width = p.pct + "%";
+    $("#curMeta").innerHTML = `<span>${gb(p.done_lbas * p.lba_size)} / ${gb(p.total_lbas * p.lba_size)} GB</span>
+      <span>${p.mb_s.toFixed(0)} MB/s</span><span>elapsed ${fmtDur(p.elapsed_s)}</span><span>remaining ${fmtDur(p.eta_s)}</span>`;
+    $("#curStats").innerHTML = statBox(bad, "bad blocks", bad ? "bad" : "") +
+      statBox(p.mismatch_lbas, "mismatched blocks", p.mismatch_lbas ? "bad" : "") +
+      statBox(p.ctrl_err_events, "controller errors", p.ctrl_err_events ? "warn" : "") +
+      statBox(p.slow_cmds, "slow commands", p.slow_cmds ? "warn" : "") +
+      statBox(ms(p.last_lat_us), "baseline latency (ms)");
+  } else if (p && p.pct != null) {
+    $("#curPct").textContent = p.pct + "%"; $("#curBar").style.width = p.pct + "%";
+    $("#curMeta").innerHTML = p.elapsed_s != null ? `<span>elapsed ${fmtDur(p.elapsed_s)}</span>` : "";
+    $("#curStats").innerHTML = "";
+  } else {
+    $("#curPct").textContent = ""; $("#curBar").style.width = "0";
+    $("#curMeta").innerHTML = "<span>in progress…</span>"; $("#curStats").innerHTML = "";
+  }
+
+  // chart: active or last read/write step
+  const label = s.io_label || (s.io_done.length ? s.io_done[s.io_done.length - 1].label : null);
+  $("#liveChartCard").classList.toggle("hidden", !label);
+  if (label && tab === "live") {
+    const changed = label !== lastIoLabel || s.dir_rel !== lastDirRel;
+    if (changed || (s.io_label && Date.now() - lastLatFetch > 4000)) {
+      lastIoLabel = label; lastDirRel = s.dir_rel; lastLatFetch = Date.now();
+      $("#liveChartTitle").textContent = `Latency – ${s.io_name || s.io_done[s.io_done.length - 1].name}${s.io_label ? " (live)" : ""}`;
+      try { drawChart($("#liveChart"), await api(`/api/latency?dir=${encodeURIComponent(s.dir_rel)}&label=${label}&points=500`), { slowMin: 20000 }); } catch (e) {}
+    }
+  }
+  $("#ioDone").innerHTML = s.io_done.length ? `<thead><tr><th>Step</th><th>Result</th><th class="num">MB/s</th><th class="num">Time</th>
+    <th class="num">Bad blocks</th><th class="num">Mismatch</th><th class="num">Ctrl err</th><th class="num">Slow</th>
+    <th class="num">p50 ms</th><th class="num">p99 ms</th><th class="num">max ms</th></tr></thead><tbody>` +
+    s.io_done.map(x => { const c = x.counts, bad = c.io_err_lbas + c.unbisected_err_lbas;
+      return `<tr><td>${esc(x.name)}</td><td>${x.result === "clean" ? '<span class="pill ok">clean</span>' : `<span class="pill bad">${esc(x.result)}</span>`}</td>
+      <td class="num">${x.mb_s.toFixed(0)}</td><td class="num">${fmtDur(x.elapsed_s)}</td>
+      <td class="num ${bad ? "nz" : ""}">${bad}</td><td class="num ${c.mismatch_lbas ? "nz" : ""}">${c.mismatch_lbas}</td>
+      <td class="num">${c.ctrl_err_events}</td><td class="num">${x.latency.slow_cmds}</td>
+      <td class="num">${ms(x.latency.p50)}</td><td class="num">${ms(x.latency.p99)}</td><td class="num">${ms(x.latency.max)}</td></tr>`; }).join("") + "</tbody>"
+    : `<tbody><tr><td class="muted">none yet</td></tr></tbody>`;
+}
+
+// ---------- log ----------
+let logOffset = -1;
+async function refreshLog() {
+  let r; try { r = await api(`/api/log?offset=${logOffset}`); } catch (e) { return; }
+  const first = logOffset < 0; logOffset = r.offset;
+  if (!r.lines.length) return;
+  const el = $("#log");
+  const html = r.lines.map(l => {
+    const cls = /HIBA:/.test(l) ? "e" : /FIGYELEM:/.test(l) ? "w" : /(KÉSZ|kész: clean|hiba nélkül|kivehető|eltávolítva)/.test(l) ? "o" : "";
+    return `<div class="${cls}">${esc(l)}</div>`; }).join("");
+  if (first) el.innerHTML = html; else el.insertAdjacentHTML("beforeend", html);
+  while (el.childElementCount > 3000) el.firstElementChild.remove();
+  if ($("#autoscroll").checked) el.scrollTop = el.scrollHeight;
+}
+
+// ---------- drives ----------
+async function loadDrives() {
+  let rows; try { rows = await api("/api/drives"); } catch (e) { return; }
+  $("#drivesCount").textContent = `${rows.length} run${rows.length === 1 ? "" : "s"}`;
+  const n = v => v === "-" || v == null ? `<td class="num muted">–</td>` : `<td class="num ${Number(v) ? "nz" : ""}">${v}</td>`;
+  $("#drivesTable").innerHTML = `<thead><tr><th>Date</th><th>S/N</th><th>Model</th><th>FW</th><th class="num">GB</th><th>Verdict</th>
+    <th class="num">POH</th><th class="num">Unsafe shutd.</th><th>Media err (pre>post)</th><th class="num" title="Pass 0: read errors in original content">P0 read</th>
+    <th class="num" title="Pass 1 write errors">P1 write</th><th class="num" title="Pass 1 read errors">P1 read</th><th class="num" title="Pass 1 mismatched blocks">P1 mism.</th><th>Erase</th>
+    <th class="num" title="Pass 2 (after erase) write errors">P2 write</th><th class="num" title="Pass 2 read errors">P2 read</th><th class="num" title="Pass 2 mismatched blocks">P2 mism.</th><th class="num">Slow</th>
+    <th class="num">Max ms</th><th class="num">Duration</th></tr></thead><tbody>` +
+    rows.map(r => `<tr class="click" data-dir="${esc(r.dir)}"><td>${esc((r.started || "").replace("T", " ").slice(0, 16))}</td>
+      <td class="mono">${esc(r.serial)}</td><td>${esc(r.model)}</td><td class="mono">${esc(r.fw)}</td><td class="num">${esc(r.cap_gb)}</td>
+      <td>${r.status === "running" ? '<span class="pill run"><span class="dot"></span>running</span>' : verdictPill(r.verdict)}</td>
+      <td class="num">${esc(r.poh ?? "–")}</td><td class="num">${esc(r.unsafe ?? "–")}</td><td class="mono">${esc(r.media_err)}</td>
+      ${n(r.p0_bad)}${n(r.p1_w)}${n(r.p1_r)}${n(r.p1_mis)}<td>${esc(ERASE[r.erase] || r.erase)}</td>${n(r.p2_w)}${n(r.p2_r)}${n(r.p2_mis)}
+      <td class="num">${esc(r.slow)}</td><td class="num">${esc(r.max_ms)}</td><td class="num">${fmtDur(r.duration_s)}</td></tr>`).join("") + "</tbody>";
+  document.querySelectorAll("#drivesTable tr.click").forEach(tr => tr.onclick = () => { location.hash = "drive=" + encodeURIComponent(tr.dataset.dir); });
+}
+
+async function showDrive(dir) {
+  const box = $("#driveDetail");
+  let d; try { d = await api(`/api/drive?dir=${encodeURIComponent(dir)}`); } catch (e) { box.innerHTML = `<div class="card">Not found: ${esc(dir)}</div>`; box.classList.remove("hidden"); return; }
+  const S = d.summary, id = S.identity || {}, pre = S.smart_pre || {}, post = S.smart_post || S.smart_mid || {};
+  const groups = S.reason_groups || {};
+  const reasons = Object.entries(groups).flatMap(([g, xs]) => xs.map(x => `<li class="${g}">${esc(x)}</li>`)).join("")
+    || `<li>all tests completed without errors</li>`;
+  const smartRows = [["power_on_hours", "Power-on hours"], ["power_cycles", "Power cycles"], ["unsafe_shutdowns", "Unsafe shutdowns"],
+    ["media_errors", "Media errors"], ["num_err_log_entries", "Error log entries"], ["avail_spare", "Available spare %"],
+    ["spare_thresh", "Spare threshold %"], ["percent_used", "Percentage used %"], ["critical_warning", "Critical warning"],
+    ["data_units_written", "Data written (GB)"], ["data_units_read", "Data read (GB)"], ["temperature_c", "Temperature °C"]];
+  const cv = (k, v) => v == null ? "–" : k.startsWith("data_units") ? gb(v * 512000) : v;
+  box.innerHTML = `
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:flex-start">
+        <div><h3>${esc(id.model || "?")}</h3><div class="muted mono">S/N ${esc(id.serial)} · FW ${esc(id.firmware)} ·
+          ${id.capacity_bytes ? gb(id.capacity_bytes) + " GB" : ""} · ${esc((S.started || "").replace("T", " "))} · ${fmtDur(S.duration_s)}</div></div>
+        <div class="row">${verdictPill(S.verdict)}<a class="btn" href="#drives">✕ close</a></div>
+      </div>
+      <div style="margin-top:8px;font-weight:600">${esc(VTEXT[S.verdict] || d.verdict_text)}</div>
+      <ul class="reasons">${reasons}</ul>
+    </div>
+    <div class="grid cols-2">
+      <div class="card"><h2>SMART – before / after test</h2><table><thead><tr><th></th><th class="num">before</th><th class="num">after</th></tr></thead><tbody>
+        ${smartRows.map(([k, l]) => { const a = cv(k, pre[k]), b = cv(k, post[k]);
+          return `<tr><td>${l}</td><td class="num mono">${a}</td><td class="num mono ${a !== b && ["media_errors", "critical_warning"].includes(k) ? "nz" : ""}">${b}</td></tr>`; }).join("")}
+      </tbody></table></div>
+      <div class="card"><h2>Read/write steps</h2><div class="scroll-x"><table><thead><tr><th>Step</th><th>Result</th>
+        <th class="num">Bad</th><th class="num">Mismatch</th><th class="num">Slow</th><th class="num">p99 ms</th><th class="num">max ms</th></tr></thead><tbody>
+        ${d.io.map(x => { const s = x.summary; if (!s) return `<tr><td>${esc(x.name)}</td><td colspan="6" class="muted">not finished</td></tr>`;
+          const bad = s.counts.io_err_lbas + s.counts.unbisected_err_lbas;
+          return `<tr><td>${esc(x.name)}</td><td>${s.result === "clean" ? '<span class="pill ok">clean</span>' : `<span class="pill bad">${esc(s.result)}</span>`}</td>
+          <td class="num ${bad ? "nz" : ""}">${bad}</td><td class="num ${s.counts.mismatch_lbas ? "nz" : ""}">${s.counts.mismatch_lbas}</td>
+          <td class="num">${s.latency_us.slow_cmds}</td><td class="num">${ms(s.latency_us.p99)}</td><td class="num">${ms(s.latency_us.max)}</td></tr>`; }).join("")}
+      </tbody></table></div></div>
+    </div>
+    <div class="card">
+      <h2>Latency</h2>
+      <div class="tabs" id="ddTabs">${d.io.map((x, i) => `<button data-l="${x.label}" class="${i ? "" : "active"}">${esc(x.name)}</button>`).join("")}</div>
+      <div class="chart-wrap"><canvas class="chart" id="ddChart"></canvas><div class="tip"></div></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>mean</span><span><i style="background:var(--warn)"></i>maximum</span>
+        <span><i style="background:var(--bad)"></i>failed command</span><span>dashed: slow threshold (20 ms)</span></div>
+      <div id="ddSlow" style="margin-top:10px"></div>
+    </div>
+    <div class="card"><h2>Summary (summary.txt, Hungarian)</h2><pre class="text">${esc(d.text)}</pre></div>
+    <div class="card"><h2>Files</h2><div class="files">
+      ${d.files.map(f => `<a href="/files/${encodeURI(f.path)}" target="_blank">${esc(f.name)} <span class="muted">(${f.size > 1e6 ? (f.size / 1e6).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " KB"})</span></a>`).join("")}
+    </div></div>`;
+  box.classList.remove("hidden");
+  const loadLat = async label => {
+    document.querySelectorAll("#ddTabs button").forEach(b => b.classList.toggle("active", b.dataset.l === label));
+    const L = await api(`/api/latency?dir=${encodeURIComponent(dir)}&label=${label}&points=700`);
+    drawChart($("#ddChart"), L, { slowMin: 20000 });
+    $("#ddSlow").innerHTML = L.slow.length ? `<table><thead><tr><th class="num">t</th><th>op</th><th class="num">LBA</th>
+      <th class="num">blocks</th><th class="num">latency ms</th><th class="num">baseline ms</th><th>status</th></tr></thead><tbody>` +
+      L.slow.slice(0, 50).map(r => `<tr><td class="num">${fmtDur(+r.t_s)}</td><td>${esc(r.op)}</td><td class="num mono">${esc(r.lba)}</td>
+        <td class="num">${esc(r.nlb)}</td><td class="num">${ms(+r.lat_us)}</td><td class="num">${ms(+r.baseline_us)}</td><td>${esc(r.status_desc)}</td></tr>`).join("") +
+      `</tbody></table>${L.slow.length > 50 ? `<div class="muted">… and ${L.slow.length - 50} more</div>` : ""}` : `<div class="muted">no slow commands</div>`;
+  };
+  document.querySelectorAll("#ddTabs button").forEach(b => b.onclick = () => loadLat(b.dataset.l));
+  if (d.io.length) loadLat(d.io[0].label);
+  box.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// ---------- report ----------
+async function loadReport(regen) {
+  if (regen) { $("#reportBtn").disabled = true; $("#reportBtn").textContent = "Generating…";
+    try { await api("/api/report", { method: "POST" }); } catch (e) {}
+    $("#reportBtn").disabled = false; $("#reportBtn").textContent = "Regenerate report"; }
+  try {
+    const r = await fetch("/files/REPORT.txt");
+    $("#reportText").textContent = r.ok ? await r.text() : "No report yet – click “Regenerate report”. (The report files are in Hungarian.)";
+  } catch (e) {}
+  try {
+    const rows = await api("/api/drives"), latest = {};
+    for (const r of rows) if (!latest[r.serial] || (r.status === "completed" && latest[r.serial].status !== "completed")) latest[r.serial] = r;
+    const cnt = {}; Object.values(latest).forEach(r => cnt[r.verdict] = (cnt[r.verdict] || 0) + 1);
+    const cls = { OK: "", SUSPECT: "warn", LOGICAL: "bad", PHYSICAL: "bad", DEAD: "bad", INCOMPLETE: "warn" };
+    $("#reportStats").innerHTML = statBox(Object.keys(latest).length, Object.keys(latest).length === 1 ? "drive" : "drives") +
+      ["OK", "SUSPECT", "LOGICAL", "PHYSICAL", "DEAD", "INCOMPLETE"].filter(k => cnt[k]).map(k => statBox(cnt[k], VSHORT[k], cls[k])).join("");
+  } catch (e) {}
+}
+$("#reportBtn").onclick = () => loadReport(true);
+
+// ---------- start ----------
+route();
+refreshStatus(); refreshLog();
+setInterval(refreshStatus, 2000);
+setInterval(refreshLog, 2000);
+setInterval(() => { if (tab === "drives" && !location.hash.startsWith("#drive=")) loadDrives(); }, 15000);
+</script>
+</body>
+</html>

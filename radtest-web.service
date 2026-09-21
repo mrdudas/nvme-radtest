@@ -1,0 +1,13 @@
+[Unit]
+Description=radtest web UI (post-irradiation NVMe testing)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/nvme-radtest
+ExecStart=/usr/bin/python3 /root/nvme-radtest/web.py --port 8090
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
