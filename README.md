@@ -7,16 +7,23 @@ Purpose: decide whether an irradiated drive is damaged **physically** (NAND, con
 
 ```bash
 make                           # build bin/nvblk (once)
-./radtest.py watch             # hot-plug: insert a drive -> test -> "can be removed" message
-./radtest.py watch --yes       # same, without asking for confirmation
+./radtest.py watch             # hot-plug watcher; each test waits for an explicit Start
+./radtest.py drives            # list the detected drives
+./radtest.py start nvme0       # start the test on that drive (same as the Start button)
 ./radtest.py status            # from another terminal: where the test currently is
 ./radtest.py report            # once every drive is done: results/REPORT.{txt,md,csv}
-./radtest.py run nvme0         # test a drive that is already attached
+./radtest.py run nvme0         # test one drive directly, without the watcher
+./radtest.py watch --auto      # old behaviour: test every inserted drive immediately
 ```
+
+**Nothing is erased until someone presses Start.** The watcher only detects the drives and
+publishes them; the test begins when a Start request arrives from the web UI or from
+`radtest.py start`. With several drives attached, each one has its own Start button, so the
+operator picks which drive to test. A drive that was already tested successfully shows
+"Test again" instead (that is the only way to re-run it; `--retest` does the same on the CLI).
 
 The operator is told about every step on the console, and during read/write work a progress line
 is printed every 30 seconds with percentage, throughput, remaining time and the errors found so far.
-A drive that has already been tested successfully is recognised and skipped (`--retest` overrides).
 Only PCIe NVMe drives are touched, and never one that is in use (mounted, part of LVM, etc.).
 
 Useful options: `--no-extended` (skip the extended self-test), `--no-erase`,
@@ -30,10 +37,12 @@ Useful options: `--no-extended` (skip the extended self-test), `--no-erase`,
 ./web.py --bind 127.0.0.1      # local only / through an SSH tunnel
 ```
 
-Read only: it never starts or stops a test. There is no password, so anyone who can reach the port
-can read the results.
-- **Live test:** drive data, state of the 11 steps, progress bar, throughput, remaining time,
-  error counters, live latency chart, log.
+There is no password, so anyone who can reach the port can read the results **and press Start,
+which erases a drive**. Bind it to localhost (`--bind 127.0.0.1`, reach it over an SSH tunnel) or
+run it with `--read-only` if that is not acceptable.
+- **Live test:** when idle, the detected drives with their Start buttons (model, serial, size, and
+  whether they were tested before); while a test runs, drive data, state of the 11 steps, progress
+  bar, throughput, remaining time, error counters, live latency chart, log.
 - **Drives:** every run in a table; click for details (SMART before/after, steps, charts,
   slow commands, summary.txt, downloadable files).
 - **Report:** regenerate and download the summary (TXT / MD / CSV).
@@ -50,9 +59,10 @@ systemctl stop radtest-watch          # stop (restores the kernel parameters)
 journalctl -u radtest-watch -f        # or: tail -f results_watch.out
 ```
 
-`radtest-watch` runs with `--yes`, because as a service there is nobody to confirm the erase with:
-**it automatically erases and tests every inserted NVMe drive that has not been tested yet.**
-On stop it receives SIGINT, so it closes the running test and restores the kernel parameters.
+`radtest-watch` runs in manual mode: it detects drives but starts nothing on its own, so a drive
+is only erased after an explicit Start. Append `--auto` to the ExecStart line if you want every
+inserted drive tested immediately. On stop the service receives SIGINT, so it closes the running
+test and restores the kernel parameters.
 
 ## Steps per drive
 

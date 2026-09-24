@@ -127,6 +127,56 @@ class Log:
             self(m)
 
 
+REQ_DIR = ".requests"
+
+
+def enqueue_start(results: Path, ctrl, serial=None, retest=False, source="cli"):
+    """Queue a start request for the watcher. Returns the request file path."""
+    d = results / REQ_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    req = {"action": "start", "ctrl": ctrl, "serial": serial, "retest": bool(retest),
+           "source": source, "created": dt.datetime.now().isoformat(timespec="seconds")}
+    f = d / f"{time.time():.6f}-{safe_name(ctrl)}.json"
+    f.write_text(json.dumps(req, ensure_ascii=False))
+    return f
+
+
+def take_requests(results: Path):
+    """Read and remove queued requests (oldest first)."""
+    d = results / REQ_DIR
+    out = []
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            pass
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return out
+
+
+def ns_size_bytes(ctrl):
+    total = 0
+    for ns in namespaces(ctrl):
+        sectors = as_int(rd(f"/sys/block/{ns}/size"), 0)
+        total += (sectors or 0) * 512
+    return total
+
+
+def drive_info(results: Path, ci):
+    """Everything the operator needs to decide whether to start a test on this drive."""
+    nss = namespaces(ci["ctrl"])
+    busy = next((in_use(ns) for ns in nss if in_use(ns)), None)
+    prev = previous_runs(results, ci["serial"]) if ci["serial"] else []
+    done = [r for r in prev if r.get("status") == "completed"]
+    return dict(ci, namespaces=nss, size_bytes=ns_size_bytes(ci["ctrl"]), in_use=busy,
+                runs=len(prev), tested=bool(done),
+                last_verdict=(done[-1] if done else (prev[-1] if prev else {})).get("verdict"),
+                last_run=(done[-1] if done else (prev[-1] if prev else {})).get("started"))
+
+
 def write_status(results: Path, **kw):
     kw["updated"] = dt.datetime.now().isoformat(timespec="seconds")
     tmp = results / ".status.json.tmp"
@@ -1587,13 +1637,13 @@ def preflight(args, log):
         sys.exit("nvme-cli not found")
 
 
-def test_one(args, log, ci):
+def test_one(args, log, ci, consent=False, retest=False):
     results = Path(args.results)
     if ci["state"] != "live":
         log(f"{ci['ctrl']} state: {ci['state']} - cannot be tested", "ERR")
         return None
     prev = already_tested(results, ci["serial"])
-    if prev and not args.retest:
+    if prev and not (args.retest or retest):
         log(f"{ci['ctrl']} S/N {ci['serial']} already tested ({prev}); skipping (retest with --retest)", "WARN")
         return None
     for ns in namespaces(ci["ctrl"]):
@@ -1601,7 +1651,7 @@ def test_one(args, log, ci):
         if why:
             log(f"{ci['ctrl']}: {why} - NOT testing it!", "ERR")
             return None
-    if not confirm(log, ci, args):
+    if not consent and not confirm(log, ci, args):
         return None
     t = DriveTest(args, log, ci)
     try:
@@ -1638,14 +1688,19 @@ def cmd_watch(args):
     mp.apply()
     transports = tuple(args.transport)
     log.banner(f"radtest hot-plug watcher started ({', '.join(transports)}); results: {results}")
-    log("Plug in an NVMe drive. The test starts automatically; I will say when it can be removed. Exit: Ctrl+C")
+    if args.auto:
+        log("AUTO mode: every inserted drive is tested without asking. Exit: Ctrl+C", "WARN")
+    else:
+        log("Plug in an NVMe drive, then press Start in the web UI (or run: radtest.py start <ctrl>). Exit: Ctrl+C")
     present = {c["ctrl"]: c for c in controllers(transports)}
     if present:
         names = ", ".join(f"{c} ({v['serial']})" for c, v in present.items())
         log(f"Controllers already attached: {names}. "
             "The kernel parameters do not apply to these (re-plugging is recommended).", "WARN")
     pci_baseline = set(nvme_pci_devices()) if "pcie" in transports else set()
-    handled, waiting_since, dead_done = set(), {}, set()
+    handled, waiting_since, dead_done, announced = set(), {}, set(), set()
+    for f in (results / REQ_DIR).glob("*.json") if (results / REQ_DIR).is_dir() else []:
+        f.unlink(missing_ok=True)  # stale requests from an earlier run
     for c in present.values():
         if c["state"] != "live":
             handled.add((c["ctrl"], c["serial"]))
@@ -1658,6 +1713,7 @@ def cmd_watch(args):
             for key in list(handled):
                 if key[0] not in now or now[key[0]]["serial"] != key[1]:
                     handled.discard(key)
+                    announced.discard(key)
                     log(f"{key[0]} (S/N {key[1]}) removed. The next drive can come.", "OK")
                     write_status(results, running=False, waiting=True)
             for c in now.values():
@@ -1668,6 +1724,23 @@ def cmd_watch(args):
                     waiting_since.setdefault(key, time.time())
                     if time.time() - waiting_since[key] < 60:
                         continue
+                if c["state"] == "live" and not args.auto:
+                    if key not in announced:
+                        announced.add(key)
+                        waiting_since.pop(key, None)
+                        if not namespaces(c["ctrl"]):
+                            time.sleep(3)
+                        info = drive_info(results, c)
+                        log(f"New drive: {c['ctrl']}  {c['model']}  S/N {c['serial']}  FW {c['firmware']}  "
+                            f"({c['address']})  {gb(info['size_bytes']):.1f} GB")
+                        if info["in_use"]:
+                            log(f"{info['in_use']} - this drive cannot be tested", "ERR")
+                        elif info["tested"]:
+                            log(f"already tested ({info['last_run']} -> {info['last_verdict']}); "
+                                f"press Start in the web UI to test it again", "WARN")
+                        else:
+                            log(f"waiting for Start (web UI, or: radtest.py start {c['ctrl']})")
+                    continue
                 handled.add(key)
                 waiting_since.pop(key, None)
                 log(f"New drive: {c['ctrl']}  {c['model']}  S/N {c['serial']}  FW {c['firmware']}  ({c['address']})")
@@ -1683,6 +1756,28 @@ def cmd_watch(args):
                 log(f">>> {c['ctrl']} (S/N {c['serial']}) DONE - the drive can be removed. <<<", "OK")
                 sys.stdout.write("\a")
                 idle_msg = time.time()
+            # start requests (web UI button / radtest.py start)
+            for req in take_requests(results):
+                c = now.get(req.get("ctrl"))
+                who = req.get("source", "?")
+                if not c:
+                    log(f"start request for {req.get('ctrl')} ignored: not present ({who})", "WARN")
+                    continue
+                if req.get("serial") and c["serial"] != req["serial"]:
+                    log(f"start request for {c['ctrl']} ignored: serial changed "
+                        f"({req['serial']} != {c['serial']})", "WARN")
+                    continue
+                key = (c["ctrl"], c["serial"])
+                handled.add(key)
+                announced.add(key)
+                log(f"START requested for {c['ctrl']} (S/N {c['serial']}) by {who}")
+                if test_one(args, log, c, consent=True, retest=bool(req.get("retest"))) is None:
+                    log(f">>> {c['ctrl']} (S/N {c['serial']}) was not tested - it can be removed. <<<", "WARN")
+                else:
+                    log(f">>> {c['ctrl']} (S/N {c['serial']}) DONE - the drive can be removed. <<<", "OK")
+                    sys.stdout.write("\a")
+                idle_msg = time.time()
+
             # visible on PCIe, but there is no live controller
             if "pcie" in transports:
                 pci = nvme_pci_devices()
@@ -1708,7 +1803,8 @@ def cmd_watch(args):
             if time.time() - idle_msg > 600:
                 idle_msg = time.time()
                 log("waiting for a drive ... (summary report: radtest.py report)")
-                write_status(results, running=False, waiting=True)
+            write_status(results, running=False, waiting=True, mode="auto" if args.auto else "manual",
+                         drives=[drive_info(results, c) for c in now.values()])
             time.sleep(2)
     except KeyboardInterrupt:
         log("watcher stopped")
@@ -1735,6 +1831,37 @@ def cmd_run(args):
     finally:
         mp.restore()
     return 0 if S and S.get("verdict") == "OK" else 1
+
+
+def cmd_start(args):
+    results = Path(args.results)
+    if not results.is_dir():
+        sys.exit(f"{results} does not exist - is the watcher running?")
+    ci = next((c for c in controllers(("pcie", "loop", "tcp", "rdma", "fc")) if c["ctrl"] == args.ctrl), None)
+    if not ci:
+        sys.exit(f"{args.ctrl} not found")
+    st = load_json(rd(results / ".status.json")) or {}
+    if st.get("running"):
+        sys.exit(f"a test is already running: {st.get('ctrl')} {st.get('serial')}")
+    f = enqueue_start(results, ci["ctrl"], ci["serial"], args.retest, source="cli")
+    print(f"start requested: {ci['ctrl']}  {ci['model']}  S/N {ci['serial']}"
+          f"{' (retest)' if args.retest else ''}")
+    print(f"the watcher picks it up within a few seconds ({f.name})")
+    return 0
+
+
+def cmd_drives(args):
+    results = Path(args.results)
+    rows = [drive_info(results, c) for c in controllers(tuple(args.transport))]
+    if not rows:
+        print("no NVMe drive detected")
+        return 1
+    print(f"{'CTRL':<8} {'MODEL':<28} {'SERIAL':<24} {'GB':>7}  {'STATE':<10} NOTE")
+    for d in rows:
+        note = d["in_use"] or (f"already tested -> {d['last_verdict']}" if d["tested"] else "not tested yet")
+        print(f"{d['ctrl']:<8} {d['model'][:28]:<28} {d['serial'][:24]:<24} "
+              f"{gb(d['size_bytes']):>7.1f}  {d['state']:<10} {note}")
+    return 0
 
 
 def cmd_status(args):
@@ -1781,13 +1908,22 @@ def main():
         p.add_argument("--report-every", type=int, default=30, help="progress report interval in seconds")
         p.add_argument("--posix", action="store_true", help=argparse.SUPPRESS)
 
-    p = sub.add_parser("watch", help="hot-plug watcher and automatic testing")
+    p = sub.add_parser("watch", help="hot-plug watcher; tests start on request (Start button)")
     test_opts(p)
+    p.add_argument("--auto", action="store_true",
+                   help="test every inserted drive immediately, without waiting for Start")
     p.set_defaults(func=cmd_watch)
     p = sub.add_parser("run", help="test one controller")
     p.add_argument("ctrl", help="e.g. nvme0")
     test_opts(p)
     p.set_defaults(func=cmd_run)
+    p = sub.add_parser("start", help="ask the running watcher to start testing a drive")
+    p.add_argument("ctrl", help="e.g. nvme0")
+    p.add_argument("--retest", action="store_true", help="test it again even if it was tested before")
+    p.set_defaults(func=cmd_start)
+    p = sub.add_parser("drives", help="list the detected NVMe drives")
+    p.add_argument("--transport", nargs="+", default=["pcie"])
+    p.set_defaults(func=cmd_drives)
     p = sub.add_parser("status", help="state of the running test")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("report", help="summary report")

@@ -6,8 +6,10 @@ ConditionPathExists=/root/nvme-radtest/bin/nvblk
 [Service]
 Type=simple
 WorkingDirectory=/root/nvme-radtest
-# --yes: szolgáltatásként nincs kivel megerősíttetni a törlést
-ExecStart=/usr/bin/python3 /root/nvme-radtest/radtest.py watch --yes
+# Manual mode: a test only starts when someone presses Start in the web UI
+# (or runs "radtest.py start <ctrl>"). Add --auto to test every inserted drive
+# immediately, without asking.
+ExecStart=/usr/bin/python3 /root/nvme-radtest/radtest.py watch
 Restart=always
 RestartSec=5
 KillSignal=SIGINT

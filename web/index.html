@@ -120,6 +120,9 @@ pre.text { background: var(--panel2); border-radius: 8px; padding: 12px; font-fa
 .files a { color: var(--accent); text-decoration: none; display: block; padding: 1px 0; break-inside: avoid; }
 .hidden { display: none !important; }
 #driveDetail { scroll-margin-top: 70px; }
+#detected table { max-width: 1000px; margin: 0 auto; }
+#detected .note { font-size: 12px; }
+#startMsg { margin-top: 10px; font-weight: 600; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 @media (max-width: 600px) { main { padding: 12px 16px; } header { padding: 10px 16px; } .progress-head .pct { font-size: 26px; } }
 </style>
@@ -145,7 +148,8 @@ pre.text { background: var(--panel2); border-radius: 8px; padding: 12px; font-fa
       <div style="font-size:42px">💤</div>
       <div class="big" id="idleTitle">No test running</div>
       <div class="muted" id="idleSub"></div>
-      <div id="idleLast" style="margin-top:16px"></div>
+      <div id="detected" style="margin-top:22px;text-align:left"></div>
+      <div id="idleLast" style="margin-top:18px"></div>
     </div>
     <div id="liveRun" class="grid cols-main hidden">
       <div class="grid" style="align-content:start">
@@ -345,9 +349,12 @@ async function refreshStatus() {
   $("#liveIdle").classList.toggle("hidden", running);
   $("#liveRun").classList.toggle("hidden", !running);
   if (!running) {
-    $("#idleTitle").textContent = s.watch_running ? "Waiting for the next drive" : "No test running";
-    $("#idleSub").textContent = s.watch_running ? "Insert the next NVMe drive – the test starts automatically."
-      : "The watcher is not running. Start it with: ./radtest.py watch";
+    const auto = (st.mode || "manual") === "auto";
+    $("#idleTitle").textContent = s.watch_running ? "Waiting for a drive" : "No test running";
+    $("#idleSub").textContent = !s.watch_running ? "The watcher is not running. Start it with: ./radtest.py watch"
+      : auto ? "AUTO mode: every inserted drive is tested without asking."
+      : "Insert an NVMe drive, then press Start on it below.";
+    renderDetected(st.drives || [], s.allow_start !== false, auto);
     if (Date.now() - lastIdleFetch > 15000) {
       lastIdleFetch = Date.now();
       try {
@@ -419,6 +426,52 @@ async function refreshStatus() {
       <td class="num">${c.ctrl_err_events}</td><td class="num">${x.latency.slow_cmds}</td>
       <td class="num">${ms(x.latency.p50)}</td><td class="num">${ms(x.latency.p99)}</td><td class="num">${ms(x.latency.max)}</td></tr>`; }).join("") + "</tbody>"
     : `<tbody><tr><td class="muted">none yet</td></tr></tbody>`;
+}
+
+function renderDetected(drives, allowStart, auto) {
+  const box = $("#detected");
+  if (!drives.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<table><thead><tr><th>Controller</th><th>Model</th><th>Serial</th><th class="num">GB</th>
+    <th>State</th><th>Status</th><th></th></tr></thead><tbody>` + drives.map(d => {
+    const busy = d.in_use, live = d.state === "live";
+    const note = busy ? `<span class="pill bad">in use: ${esc(busy)}</span>`
+      : d.tested ? `<span class="pill ${VCLS[d.last_verdict] || ""}">tested · ${esc(VSHORT[d.last_verdict] || "?")}</span>
+          <span class="muted note">${esc((d.last_run || "").replace("T", " ").slice(0, 16))}</span>`
+      : `<span class="pill">not tested yet</span>`;
+    const btn = !allowStart ? `<span class="muted note">read-only UI</span>`
+      : auto ? `<span class="muted note">auto mode</span>`
+      : !live ? `<span class="muted note">${esc(d.state)}</span>`
+      : busy ? `<span class="muted note">protected</span>`
+      : `<button class="${d.tested ? "" : "primary"}" data-start="${esc(d.ctrl)}" data-serial="${esc(d.serial)}"
+           data-retest="${d.tested ? 1 : 0}" data-model="${esc(d.model)}" data-gb="${gb(d.size_bytes)}">
+           ${d.tested ? "Test again" : "Start test"}</button>`;
+    return `<tr><td class="mono">${esc(d.ctrl)}</td><td>${esc(d.model)}</td><td class="mono">${esc(d.serial)}</td>
+      <td class="num">${gb(d.size_bytes)}</td><td>${esc(d.state)}</td><td>${note}</td><td>${btn}</td></tr>`;
+  }).join("") + `</tbody>`;
+  box.insertAdjacentHTML("beforeend", `<div id="startMsg"></div>`);
+  box.querySelectorAll("button[data-start]").forEach(b => b.onclick = () => startTest(b));
+}
+
+async function startTest(btn) {
+  const d = btn.dataset;
+  if (!confirm(`Start the test on ${d.model} (S/N ${d.serial}, ${d.gb} GB)?\n\n` +
+      `THIS ERASES THE WHOLE DRIVE: it is written, erased and written again.` +
+      (d.retest === "1" ? `\n\nThis drive has been tested before; a new run will be recorded.` : ""))) return;
+  btn.disabled = true;
+  const msg = $("#startMsg");
+  msg.textContent = "Start requested…"; msg.style.color = "var(--muted)";
+  try {
+    const r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ctrl: d.start, serial: d.serial, retest: d.retest === "1" }) });
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+    msg.textContent = `Start requested for ${d.start} – the test begins in a few seconds.`;
+    msg.style.color = "var(--ok)";
+  } catch (e) {
+    msg.textContent = "Could not start: " + e.message;
+    msg.style.color = "var(--bad)";
+    btn.disabled = false;
+  }
 }
 
 // ---------- log ----------

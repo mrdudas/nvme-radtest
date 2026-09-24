@@ -11,6 +11,7 @@ API:
   GET  /api/latency?dir=..&label=pass1/write   latency time series (bucketed)
   GET  /api/log?offset=N           new lines of radtest.log
   POST /api/report                 regenerate the summary report
+  POST /api/start                  ask the watcher to start a test on a drive
   GET  /files/<path>               download a file from under results
 """
 import argparse
@@ -55,6 +56,7 @@ IO_LABELS = [
 ]
 
 RESULTS = ROOT / "results"
+ALLOW_START = True  # a Start gomb kikapcsolható: --read-only
 
 
 def load(path):
@@ -228,7 +230,7 @@ def run_detail(rel):
 def current_status():
     st = load(RESULTS / ".status.json") or {}
     out = {"status": st, "watch_running": watch_running(), "now": time.strftime("%Y-%m-%dT%H:%M:%S"),
-           "steps": None}
+           "steps": None, "allow_start": ALLOW_START}
     if st.get("running") and st.get("dir"):
         d = Path(st["dir"])
         S = load(d / "summary.json") or {}
@@ -368,8 +370,44 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def read_body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if not 0 < n <= 65536:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode()) or {}
+        except (ValueError, OSError):
+            return {}
+
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/start":
+            if not ALLOW_START:
+                return self.send(403, {"error": "this UI runs read-only (--read-only)"})
+            body = self.read_body()
+            ctrl, serial = str(body.get("ctrl", "")), body.get("serial")
+            if not re.fullmatch(r"nvme\d+", ctrl):
+                return self.send(400, {"error": "bad controller name"})
+            st = load(RESULTS / ".status.json") or {}
+            if st.get("running"):
+                return self.send(409, {"error": f"a test is already running on {st.get('ctrl')}"})
+            if not st.get("mode"):
+                return self.send(409, {"error": "the watcher is not running"})
+            ci = next((c for c in radtest.controllers(("pcie", "loop", "tcp", "rdma", "fc"))
+                       if c["ctrl"] == ctrl), None)
+            if not ci:
+                return self.send(404, {"error": f"{ctrl} is not present"})
+            if serial and ci["serial"] != serial:
+                return self.send(409, {"error": "the drive changed, reload the page"})
+            info = radtest.drive_info(RESULTS, ci)
+            if info["in_use"]:
+                return self.send(409, {"error": info["in_use"]})
+            who = f"web {self.client_address[0]}"
+            radtest.enqueue_start(RESULTS, ctrl, ci["serial"], bool(body.get("retest")), source=who)
+            return self.send(200, {"ok": True, "ctrl": ctrl, "serial": ci["serial"]})
         if u.path == "/api/report":
             buf = io.StringIO()
             old = sys.stdout
@@ -385,13 +423,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global RESULTS
+    global RESULTS, ALLOW_START
     ap = argparse.ArgumentParser(description="radtest web UI")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--results", default=str(ROOT / "results"))
+    ap.add_argument("--read-only", action="store_true",
+                    help="disable the Start button (display only)")
     a = ap.parse_args()
     RESULTS = Path(a.results).resolve()
+    ALLOW_START = not a.read_only
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.daemon_threads = True
     print(f"radtest web: http://{a.bind}:{a.port}/  (results: {RESULTS})", flush=True)
