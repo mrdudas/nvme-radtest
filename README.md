@@ -43,8 +43,12 @@ run it with `--read-only` if that is not acceptable.
 - **Live test:** when idle, the detected drives with their Start buttons (model, serial, size, and
   whether they were tested before); while a test runs, drive data, state of the 11 steps, progress
   bar, throughput, remaining time, error counters, live latency chart, log.
-- **Drives:** every run in a table; click for details (SMART before/after, steps, charts,
-  slow commands, summary.txt, downloadable files).
+- **Drives:** the runs are grouped by serial number, one row per physical drive, showing its latest
+  completed run. Earlier runs are listed under it with their verdicts, so it is visible when a test
+  misran and had to be repeated; a drive with an unfinished earlier run is expanded by default.
+  Click a row for the details (SMART before/after, steps, charts, slow commands, summary.txt,
+  downloadable files). The bin icon removes a run: it is moved to `results/.trash/` (so it can be
+  restored by moving the directory back) and disappears from the list and from the report.
 - **Report:** regenerate and download the summary (TXT / MD / CSV).
 
 ## Running as a service (systemd)
@@ -112,6 +116,8 @@ results/
     pass0/ pass1/ erase/ pass2/    <step>_errors.csv, _slow.csv, _latency.csv, _summary.json
     kernel.log, kernel_drive.log
   NOT_ENUMERATED_<PCI address>/... drives that never came up
+  .requests/                       queued start requests (handled within seconds)
+  .trash/                          runs removed from the UI; delete by hand when no longer needed
 ```
 
 ## Kernel settings

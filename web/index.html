@@ -121,6 +121,17 @@ pre.text { background: var(--panel2); border-radius: 8px; padding: 12px; font-fa
 .hidden { display: none !important; }
 #driveDetail { scroll-margin-top: 70px; }
 #detected table { max-width: 1000px; margin: 0 auto; }
+#drivesTable tr.sub td { background: var(--panel2); font-size: 12px; }
+#drivesTable tr.grp + tr.sub td { border-top: 0; }
+.hist { margin-top: 3px; }
+button.linkish { border: 0; background: none; color: var(--muted); padding: 0; font-size: 12px; cursor: pointer; }
+button.linkish:hover { color: var(--accent); }
+td.delcol, th.delcol { width: 34px; padding-left: 4px; padding-right: 0; position: sticky; left: 0;
+  background: var(--panel); }
+#drivesTable tr.sub td.delcol { background: var(--panel2); }
+button.del { border: 0; background: none; padding: 2px 6px; opacity: .35; cursor: pointer; font-size: 14px; }
+tr:hover button.del { opacity: 1; }
+button.del:hover { color: var(--bad); }
 #detected .note { font-size: 12px; }
 #startMsg { margin-top: 10px; font-weight: 600; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -491,22 +502,88 @@ async function refreshLog() {
 }
 
 // ---------- drives ----------
+const expanded = new Set();
+let expandInit = false;
+
 async function loadDrives() {
   let rows; try { rows = await api("/api/drives"); } catch (e) { return; }
-  $("#drivesCount").textContent = `${rows.length} run${rows.length === 1 ? "" : "s"}`;
+  // group the runs of one physical drive (same serial) together
+  const groups = new Map();
+  for (const r of rows) {
+    const key = r.serial || r.dir;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  for (const list of groups.values()) list.sort((a, b) => (b.started || "").localeCompare(a.started || ""));
+  const order = [...groups.entries()].sort((a, b) =>
+    (b[1][0].started || "").localeCompare(a[1][0].started || ""));
+  $("#drivesCount").textContent = `${groups.size} drive${groups.size === 1 ? "" : "s"} · ${rows.length} run${rows.length === 1 ? "" : "s"}`;
+
   const n = v => v === "-" || v == null ? `<td class="num muted">–</td>` : `<td class="num ${Number(v) ? "nz" : ""}">${v}</td>`;
-  $("#drivesTable").innerHTML = `<thead><tr><th>Date</th><th>S/N</th><th>Model</th><th>FW</th><th class="num">GB</th><th>Verdict</th>
-    <th class="num">POH</th><th class="num">Unsafe shutd.</th><th>Media err (pre>post)</th><th class="num" title="Pass 0: read errors in original content">P0 read</th>
-    <th class="num" title="Pass 1 write errors">P1 write</th><th class="num" title="Pass 1 read errors">P1 read</th><th class="num" title="Pass 1 mismatched blocks">P1 mism.</th><th>Erase</th>
-    <th class="num" title="Pass 2 (after erase) write errors">P2 write</th><th class="num" title="Pass 2 read errors">P2 read</th><th class="num" title="Pass 2 mismatched blocks">P2 mism.</th><th class="num">Slow</th>
-    <th class="num">Max ms</th><th class="num">Duration</th></tr></thead><tbody>` +
-    rows.map(r => `<tr class="click" data-dir="${esc(r.dir)}"><td>${esc((r.started || "").replace("T", " ").slice(0, 16))}</td>
-      <td class="mono">${esc(r.serial)}</td><td>${esc(r.model)}</td><td class="mono">${esc(r.fw)}</td><td class="num">${esc(r.cap_gb)}</td>
+  const cells = r => `<td class="mono">${esc(r.fw)}</td><td class="num">${esc(r.cap_gb)}</td>
       <td>${r.status === "running" ? '<span class="pill run"><span class="dot"></span>running</span>' : verdictPill(r.verdict)}</td>
       <td class="num">${esc(r.poh ?? "–")}</td><td class="num">${esc(r.unsafe ?? "–")}</td><td class="mono">${esc(r.media_err)}</td>
       ${n(r.p0_bad)}${n(r.p1_w)}${n(r.p1_r)}${n(r.p1_mis)}<td>${esc(ERASE[r.erase] || r.erase)}</td>${n(r.p2_w)}${n(r.p2_r)}${n(r.p2_mis)}
-      <td class="num">${esc(r.slow)}</td><td class="num">${esc(r.max_ms)}</td><td class="num">${fmtDur(r.duration_s)}</td></tr>`).join("") + "</tbody>";
-  document.querySelectorAll("#drivesTable tr.click").forEach(tr => tr.onclick = () => { location.hash = "drive=" + encodeURIComponent(tr.dataset.dir); });
+      <td class="num">${esc(r.slow)}</td><td class="num">${esc(r.max_ms)}</td><td class="num">${fmtDur(r.duration_s)}</td>`;
+  const delCell = r => `<td class="delcol">${r.status === "running" ? "" :
+      `<button class="del" title="Remove this run from the results" data-del="${esc(r.dir)}"
+        data-what="${esc(r.serial)} · ${when(r)} · ${esc(r.verdict)}">🗑</button>`}</td>`;
+  const when = r => esc((r.started || "").replace("T", " ").slice(0, 16));
+
+  let body = "";
+  for (const [key, list] of order) {
+    // the drive's own result is the latest completed run; earlier ones are history
+    const main = list.find(r => r.status === "completed") || list[0];
+    const rest = list.filter(r => r !== main);
+    // a drive whose earlier run did not finish is shown expanded, that is the interesting case
+    if (!expandInit && rest.some(r => r.status !== "completed")) expanded.add(key);
+    const open = expanded.has(key);
+    const hist = rest.length
+      ? `<button class="linkish" data-toggle="${esc(key)}"><span class="caret">${open ? "▾" : "▸"}</span> ${rest.length} earlier run${rest.length === 1 ? "" : "s"}:
+           ${rest.map(r => `<span class="pill ${VCLS[r.verdict] || ""}">${esc(VSHORT[r.verdict] || "?")}</span>`).join(" ")}</button>`
+      : "";
+    body += `<tr class="click grp" data-dir="${esc(main.dir)}">${delCell(main)}<td>${when(main)}</td>
+      <td class="mono"><b>${esc(main.serial)}</b></td><td>${esc(main.model)}${hist ? `<div class="hist">${hist}</div>` : ""}</td>
+      ${cells(main)}</tr>`;
+    for (const r of rest) {
+      body += `<tr class="click sub ${open ? "" : "hidden"}" data-grp="${esc(key)}" data-dir="${esc(r.dir)}">
+        ${delCell(r)}<td class="muted">↳ ${when(r)}</td><td class="muted mono">${esc(r.serial)}</td>
+        <td class="muted">${r.status === "completed" ? "earlier run" : `did not finish (${esc(r.status || "?")})`}</td>
+        ${cells(r)}</tr>`;
+    }
+  }
+  expandInit = true;
+  $("#drivesTable").innerHTML = `<thead><tr><th class="delcol"></th><th>Date</th><th>S/N</th><th>Model / history</th><th>FW</th><th class="num">GB</th><th>Verdict</th>
+    <th class="num">POH</th><th class="num">Unsafe shutd.</th><th>Media err (pre>post)</th><th class="num" title="Pass 0: read errors in original content">P0 read</th>
+    <th class="num" title="Pass 1 write errors">P1 write</th><th class="num" title="Pass 1 read errors">P1 read</th><th class="num" title="Pass 1 mismatched blocks">P1 mism.</th><th>Erase</th>
+    <th class="num" title="Pass 2 (after erase) write errors">P2 write</th><th class="num" title="Pass 2 read errors">P2 read</th><th class="num" title="Pass 2 mismatched blocks">P2 mism.</th><th class="num">Slow</th>
+    <th class="num">Max ms</th><th class="num">Duration</th></tr></thead><tbody>` + body + "</tbody>";
+
+  document.querySelectorAll("#drivesTable tr.click").forEach(tr => tr.onclick = ev => {
+    if (ev.target.closest("button[data-toggle]") || ev.target.closest("button[data-del]")) return;
+    location.hash = "drive=" + encodeURIComponent(tr.dataset.dir);
+  });
+  document.querySelectorAll("#drivesTable button[data-del]").forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    if (!confirm(`Remove this run from the results?\n\n${b.dataset.what}\n\n` +
+        `It is moved to results/.trash, so it can be restored, and it disappears from the report.`)) return;
+    b.disabled = true;
+    try {
+      const r = await fetch("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dir: b.dataset.del }) });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+      loadDrives();
+    } catch (e) { alert("Could not remove: " + e.message); b.disabled = false; }
+  });
+  document.querySelectorAll("#drivesTable button[data-toggle]").forEach(b => b.onclick = ev => {
+    ev.stopPropagation();
+    const key = b.dataset.toggle;
+    expanded.has(key) ? expanded.delete(key) : expanded.add(key);
+    document.querySelectorAll(`#drivesTable tr.sub[data-grp="${CSS.escape(key)}"]`)
+      .forEach(tr => tr.classList.toggle("hidden", !expanded.has(key)));
+    b.querySelector(".caret").textContent = expanded.has(key) ? "▾" : "▸";
+  });
 }
 
 async function showDrive(dir) {

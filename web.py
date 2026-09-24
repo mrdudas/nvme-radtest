@@ -12,6 +12,7 @@ API:
   GET  /api/log?offset=N           new lines of radtest.log
   POST /api/report                 regenerate the summary report
   POST /api/start                  ask the watcher to start a test on a drive
+  POST /api/delete                 move one run into results/.trash (reversible)
   GET  /files/<path>               download a file from under results
 """
 import argparse
@@ -186,6 +187,8 @@ def latency_series(run_dir, label, points=600):
 def all_runs():
     runs = []
     for f in RESULTS.glob("*/*/summary.json"):
+        if any(part.startswith(".") for part in f.relative_to(RESULTS).parts):
+            continue  # .trash and other hidden directories
         S = load(f)
         if not S:
             continue
@@ -408,6 +411,33 @@ class Handler(BaseHTTPRequestHandler):
             who = f"web {self.client_address[0]}"
             radtest.enqueue_start(RESULTS, ctrl, ci["serial"], bool(body.get("retest")), source=who)
             return self.send(200, {"ok": True, "ctrl": ctrl, "serial": ci["serial"]})
+        if u.path == "/api/delete":
+            if not ALLOW_START:
+                return self.send(403, {"error": "this UI runs read-only (--read-only)"})
+            rel = str(self.read_body().get("dir", ""))
+            d = safe_rel(rel)
+            if not d or not (d / "summary.json").exists() or d.parent == RESULTS:
+                return self.send(404, {"error": "no such run"})
+            st = load(RESULTS / ".status.json") or {}
+            if st.get("running") and str(st.get("dir") or "") == str(d):
+                return self.send(409, {"error": "this test is running right now"})
+            trash = RESULTS / ".trash"
+            trash.mkdir(exist_ok=True)
+            dest = trash / f"{d.parent.name}__{d.name}"
+            i = 1
+            while dest.exists():
+                dest = trash / f"{d.parent.name}__{d.name}__{i}"
+                i += 1
+            try:
+                d.rename(dest)
+            except OSError as ex:
+                return self.send(500, {"error": str(ex)})
+            try:
+                if d.parent.is_dir() and not any(d.parent.iterdir()):
+                    d.parent.rmdir()
+            except OSError:
+                pass
+            return self.send(200, {"ok": True, "moved_to": str(dest.relative_to(RESULTS))})
         if u.path == "/api/report":
             buf = io.StringIO()
             old = sys.stdout

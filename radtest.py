@@ -1521,6 +1521,8 @@ def cmd_report(args):
     results = Path(args.results)
     runs = {}
     for f in sorted(results.glob("*/*/summary.json")):
+        if any(part.startswith(".") for part in f.relative_to(results).parts):
+            continue  # .trash and other hidden directories
         S = load_json(f.read_text())
         if not S:
             continue
