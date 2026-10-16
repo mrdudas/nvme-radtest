@@ -68,6 +68,23 @@ is only erased after an explicit Start. Append `--auto` to the ExecStart line if
 inserted drive tested immediately. On stop the service receives SIGINT, so it closes the running
 test and restores the kernel parameters.
 
+## Write protection (Micron)
+
+A drive can come back from irradiation with its namespace write protected: every write is refused
+with NVMe status `SCT0/SC0x20 Namespace Is Write Protected`, the namespace reports NSATTR read-only
+and the kernel marks the block device read-only. radtest checks this after identify and before each
+write pass, and `nvblk` stops a write pass immediately instead of grinding through the whole drive.
+
+On **Micron drives only** (PCI VID 0x1344) and **only when the namespace really is locked**, radtest
+clears the protection: `set-feature 0x84 = 0` (No Write Protect) followed by `ns-rescan`, then it
+re-reads every signal and continues the test. The attempt, the state before and after and the
+outcome all land in summary.json / summary.txt and in the verdict reasons.
+
+It never sets a protection, and it never tries to clear what cannot be cleared:
+"write protect until power cycle" (only unplugging helps) and "permanent write protect"
+(irreversible) are reported and the test moves on. If the drive put *itself* into read-only mode
+(SMART critical warning bit 3), that is a drive failure, not a software lock, so it is left alone.
+
 ## Steps per drive
 
 | # | Step | What it gives |

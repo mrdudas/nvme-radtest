@@ -96,6 +96,7 @@ struct ctx {
 	uint64_t hist[HBUCKETS];
 	int consec_failed_chunks, consec_ctrl, bisect_off;
 	int device_lost;
+	int write_protected; /* SCT0/SC0x20: pointless to continue, the namespace is locked */
 	char abort_reason[128];
 	struct timespec t0;
 	double last_progress;
@@ -164,6 +165,7 @@ static const char *status_desc(int st)
 		case 0x0b: d = "Invalid Namespace or Format"; break;
 		case 0x0d: d = "Invalid Field in Command"; break;
 		case 0x1c: d = "Sanitize In Progress"; break;
+		case 0x20: d = "Namespace Is Write Protected"; break;
 		case 0x80: d = "LBA Out of Range"; break;
 		case 0x81: d = "Capacity Exceeded"; break;
 		case 0x82: d = "Namespace Not Ready"; break;
@@ -503,6 +505,17 @@ static uint64_t io_range(struct ctx *c, int wr, uint64_t base, uint64_t lba, uin
 		}
 		/* it turned into a non-controller error: continue on the normal path */
 	}
+	if (sct == 0 && sc == 0x20) {
+		/* namespace write protected: every further write would fail the same way */
+		c->write_protected = 1;
+		c->io_err_events++;
+		count_status(c, st, n);
+		record(c, "write_protected", lba, n, st, 0, 0);
+		snprintf(c->abort_reason, sizeof c->abort_reason, "namespace is write protected: %s",
+			 status_desc(st));
+		memset(c->failmap + (lba - base), 1, n);
+		return n;
+	}
 	if (n == 1 || c->bisect_off) {
 		c->io_err_events++;
 		count_status(c, st, n);
@@ -656,6 +669,7 @@ static void summary(struct ctx *c, const char *result)
 		c->start, c->end, c->done_lbas);
 	fprintf(f, "  \"chunk_lbas\": %u,\n  \"result\": \"%s\",\n  \"abort_reason\": \"%s\",\n", c->chunk,
 		result, c->abort_reason);
+	fprintf(f, "  \"write_protected\": %s,\n", c->write_protected ? "true" : "false");
 	fprintf(f, "  \"device_lost\": %s,\n  \"interrupted\": %s,\n", c->device_lost ? "true" : "false",
 		g_stop ? "true" : "false");
 	fprintf(f, "  \"elapsed_s\": %.1f,\n  \"mb_s\": %.1f,\n", t,
@@ -859,14 +873,14 @@ int main(int argc, char **argv)
 
 	clock_gettime(CLOCK_MONOTONIC, &c.t0);
 	int wr = c.mode == M_WRITE;
-	for (uint64_t lba = c.start; lba < c.end && !g_stop && !c.device_lost;) {
+	for (uint64_t lba = c.start; lba < c.end && !g_stop && !c.device_lost && !c.write_protected;) {
 		uint32_t n = (uint32_t)((c.end - lba) < c.chunk ? (c.end - lba) : c.chunk);
 		memset(c.failmap, 0, n);
 		if (wr)
 			for (uint32_t i = 0; i < n; i++)
 				fill_block(&c, c.buf + (uint64_t)i * c.lbs, lba + i);
 		uint64_t failed = io_range(&c, wr, lba, lba, n);
-		if (c.device_lost || g_stop)
+		if (c.device_lost || g_stop || c.write_protected)
 			break;
 		if (failed == n) {
 			if (++c.consec_failed_chunks >= MAX_CONSEC_FAILED_CHUNKS && !c.bisect_off) {
@@ -899,7 +913,10 @@ int main(int argc, char **argv)
 
 	const char *result;
 	int rc;
-	if (c.device_lost) {
+	if (c.write_protected) {
+		result = "write_protected";
+		rc = 1;
+	} else if (c.device_lost) {
 		result = "device_lost";
 		rc = 3;
 	} else if (g_stop) {

@@ -638,6 +638,85 @@ def error_log_summary(parsed):
     return {"entries_read": total, "by_status": by_status, "lbas": sorted(set(lbas))[:200]}
 
 
+MICRON_VIDS = (0x1344,)  # Micron / Crucial
+
+WP_STATES = {0: "no write protect", 1: "write protect",
+             2: "write protect until power cycle", 3: "permanent write protect"}
+
+
+def write_protect_state(ctrl, ns, nsid=1):
+    """Every signal that says the namespace cannot be written."""
+    st = {}
+    g = nvme(["get-feature", f"/dev/{ns}", "-n", str(nsid), "-f", "0x84", "--no-retries"], timeout=30)
+    m = re.search(r"Current value:\s*(?:0x)?([0-9a-fA-F]+)", g["stdout"])
+    st["feature_0x84"] = int(m.group(1), 16) if m else None
+    st["feature_0x84_text"] = WP_STATES.get(st["feature_0x84"], "unknown")
+    st["feature_supported"] = g["rc"] == 0
+    idn = load_json(nvme(["id-ns", f"/dev/{ns}", "-o", "json", "--no-retries"], timeout=30)["stdout"]) or {}
+    st["nsattr"] = as_int(idn.get("nsattr"))
+    st["ns_write_protected"] = bool((st["nsattr"] or 0) & 1)
+    st["sysfs_ro"] = rd(f"/sys/block/{ns}/ro") == "1"
+    sm = load_json(nvme(["smart-log", f"/dev/{ctrl}", "-o", "json", "--no-retries"], timeout=30)["stdout"]) or {}
+    st["smart_read_only"] = bool((as_int(sm.get("critical_warning"), 0) or 0) & 0x08)
+    st["locked"] = bool(st["feature_0x84"] or st["ns_write_protected"] or st["sysfs_ro"]
+                        or st["smart_read_only"])
+    return st
+
+
+def unlock_namespace(ctrl, ns, idn, log, nsid=1):
+    """
+    Clear a software write protection - Micron drives only, and only when the namespace
+    really is locked. Only the reversible transition is used (Write Protect -> No Write
+    Protect); nothing here can set a protection or touch the firmware.
+    """
+    res = {"attempted": False, "unlocked": False}
+    res["before"] = before = write_protect_state(ctrl, ns, nsid)
+    if not before["locked"]:
+        res["reason"] = "not locked"
+        return res
+    vid = idn.get("vid")
+    log(f"the namespace is write protected: {before['feature_0x84_text']}"
+        f"{' (NSATTR read-only)' if before['ns_write_protected'] else ''}"
+        f"{' (kernel marked it read-only)' if before['sysfs_ro'] else ''}", "WARN")
+    if vid not in MICRON_VIDS:
+        res["reason"] = f"not a Micron drive (VID 0x{(vid or 0):04x}) - not unlocking"
+        log(res["reason"], "WARN")
+        return res
+    fw = before["feature_0x84"]
+    if fw == 3:
+        res["reason"] = "PERMANENT write protect - it cannot be cleared by any command"
+        log(res["reason"], "ERR")
+        return res
+    if fw == 2:
+        res["reason"] = ("write protect until power cycle - only a power cycle clears it; "
+                         "unplug the drive and plug it back in")
+        log(res["reason"], "ERR")
+        return res
+    if before["smart_read_only"] and not fw:
+        res["reason"] = ("the drive switched itself to read-only mode (SMART critical warning), "
+                         "this is not a software lock")
+        log(res["reason"], "ERR")
+        return res
+    res["attempted"] = True
+    log("Micron drive: clearing the namespace write protection (feature 0x84 -> 0)")
+    r = nvme(["set-feature", f"/dev/{ns}", "-n", str(nsid), "-f", "0x84", "-V", "0", "--no-retries"],
+             timeout=60)
+    res["set_feature"] = {"rc": r["rc"], "out": (r["stdout"] or r["stderr"]).strip()[:200]}
+    if r["rc"] != 0:
+        log(f"set-feature 0x84 failed: {res['set_feature']['out']}", "ERR")
+    nvme(["ns-rescan", f"/dev/{ctrl}"], timeout=60)  # clears the kernel's read-only flag
+    time.sleep(2)
+    res["after"] = after = write_protect_state(ctrl, ns, nsid)
+    res["unlocked"] = not after["locked"]
+    if res["unlocked"]:
+        log("the write protection is cleared, the namespace is writable again", "OK")
+    else:
+        res["reason"] = (f"still locked after the attempt: {after['feature_0x84_text']}"
+                         f"{', kernel read-only' if after['sysfs_ro'] else ''}")
+        log(res["reason"], "ERR")
+    return res
+
+
 def identity(parsed):
     ic, ns = parsed.get("id_ctrl") or {}, parsed.get("id_ns") or {}
     lbaf = []
@@ -822,6 +901,7 @@ class DriveTest:
         self.S["supported_lids"] = p.get("supported_lids")
         self.S["identity_anomalies"] = identity_anomalies(idn, self.ci)
         self.print_identity()
+        self.check_unlock("identify")
         self.step_done("identify", {})
 
         # 2-3. self-tests
@@ -843,7 +923,8 @@ class DriveTest:
         self.write_cache_off()
         seed1 = secrets.randbits(62)
         self.step("pass 1: full write")
-        self.S["pass1"] = {"seed": seed1, "write": self.nvblk("write", "pass1", "write", seed1)}
+        self.check_unlock("before pass 1")
+        self.S["pass1"] = {"seed": seed1, "write": self.write_pass("pass1", "write", seed1)}
         self.step_done("pass1_write", {})
         self.step("pass 1: read back and verify")
         self.S["pass1"]["verify"] = self.nvblk("verify", "pass1", "verify", seed1)
@@ -872,7 +953,8 @@ class DriveTest:
         self.write_cache_off()
         seed2 = secrets.randbits(62)
         self.step("pass 2: full write")
-        self.S["pass2"] = {"seed": seed2, "write": self.nvblk("write", "pass2", "write", seed2)}
+        self.check_unlock("before pass 2")
+        self.S["pass2"] = {"seed": seed2, "write": self.write_pass("pass2", "write", seed2)}
         self.step_done("pass2_write", {})
         self.step("pass 2: read back and verify")
         self.S["pass2"]["verify"] = self.nvblk("verify", "pass2", "verify", seed2)
@@ -925,6 +1007,51 @@ class DriveTest:
             self.log(f"  {k}: {v}")
         for a in self.S["identity_anomalies"]:
             self.log(f"identify anomaly: {a}", "WARN")
+
+    def check_unlock(self, where):
+        """Look for a software write protection and clear it (Micron only). True if writable."""
+        res = unlock_namespace(self.ctrl, self.ns, self.S.get("identity") or {}, self.log)
+        res["where"] = where
+        if res.get("reason") == "not locked" and not self.S.get("write_protect"):
+            self.S["write_protect"] = {"state": res["before"], "events": []}
+            return True
+        wp = self.S.setdefault("write_protect", {"state": res["before"], "events": []})
+        wp["state"] = res.get("after") or res["before"]
+        if res.get("reason") != "not locked":
+            wp["events"].append(res)
+        return not wp["state"]["locked"]
+
+    def wp_blocked(self, summ):
+        """Did the write fail because the namespace is write protected?"""
+        summ = summ or {}
+        if summ.get("write_protected") or summ.get("result") == "write_protected":
+            return True
+        for x in summ.get("statuses", []):
+            st = x.get("status") or 0
+            sct, sc = (st >> 8) & 7, st & 0xFF
+            # generic 20h = Namespace Is Write Protected, cmd specific 82h = write to read-only range
+            if (sct == 0 and sc == 0x20) or (sct == 1 and sc == 0x82):
+                return True
+        return False
+
+    def keep_attempt(self, sub, label, suffix):
+        """Keep the files of a blocked attempt instead of overwriting them on the retry."""
+        d = self.dir / sub
+        for f in sorted(d.glob(f"{label}_*")):
+            f.rename(d / f"{label}_{suffix}_{f.name[len(label) + 1:]}")
+
+    def write_pass(self, sub, label, seed):
+        """Write pass; if the namespace turns out to be write protected, unlock once and repeat."""
+        summ = self.nvblk("write", sub, label, seed)
+        if not self.wp_blocked(summ):
+            return summ
+        self.log("the write was refused: the namespace is write protected", "ERR")
+        if not self.check_unlock(f"{sub}/{label}") :
+            return summ
+        self.keep_attempt(sub, label, "wp_blocked")
+        self.S.setdefault(sub, {})["write_blocked"] = summ
+        self.log("retrying the write pass after the unlock", "WARN")
+        return self.nvblk("write", sub, label, seed)
 
     def write_cache_off(self):
         idn = self.S["identity"]
@@ -1291,6 +1418,17 @@ def evaluate(S):
     slow, mx = slow_stats(S)
     if slow:
         susp.append(f"{slow} outlier-slow commands (max {mx / 1000:.0f} ms): the drive was busy in the background")
+    wp = S.get("write_protect") or {}
+    for ev in wp.get("events", []):
+        if ev.get("unlocked"):
+            logical.append(f"the namespace was write protected ({ev['before']['feature_0x84_text']}) "
+                           f"at '{ev.get('where')}'; the lock was cleared and the test continued")
+        elif ev.get("attempted"):
+            logical.append(f"the namespace is write protected and could not be cleared: {ev.get('reason')}")
+        elif ev.get("reason") and ev.get("reason") != "not locked":
+            logical.append(f"the namespace is write protected: {ev['reason']}")
+    if (wp.get("state") or {}).get("locked"):
+        susp.append("the namespace is still write protected at the end of the test")
     tel = S.get("telemetry") or {}
     if tel.get("hang"):
         susp.append(f"the controller hung on the standard telemetry fetch: {tel['hang']}")
@@ -1418,6 +1556,19 @@ def drive_text(S):
         if r.get("failing_lba") is not None:
             extra += f" LBA {r['failing_lba']}"
         L.append(f"  {name:<18} {r.get('result_desc')}{extra}")
+    wp = S.get("write_protect") or {}
+    if wp:
+        st = wp.get("state") or {}
+        L.append("")
+        L.append("Namespace write protection")
+        L.append(f"  state at the end: {st.get('feature_0x84_text')}"
+                 f"{' / NSATTR read-only' if st.get('ns_write_protected') else ''}"
+                 f"{' / kernel read-only' if st.get('sysfs_ro') else ''}"
+                 f"{' / SMART read-only mode' if st.get('smart_read_only') else ''}")
+        for ev in wp.get("events", []):
+            L.append(f"  {ev.get('where')}: {ev['before'].get('feature_0x84_text')} -> "
+                     f"{'cleared' if ev.get('unlocked') else 'NOT cleared'}"
+                     f"{'' if ev.get('unlocked') else ' (' + str(ev.get('reason')) + ')'}")
     L.append("")
     L.append(f"Write/read tests (drive write cache: {S.get('vwc', '?')})")
     L.append(pass_line("pass 0: read original content", (S.get("pass0") or {}).get("readscan")))
