@@ -104,8 +104,10 @@ saves everything that the erase would wipe (controller telemetry, persistent eve
 vendor logs, `msecli -P` if present) into `results/<serial>/<timestamp>-recovery/`, and prints the
 exact manual steps: `nvme sanitize -a 2 --ause` → poll `sanitize-log` until "Completed Successfully"
 → power cycle (a controller reset is not enough) → `nvme attach-ns -n 1 -c 0` → `ns-rescan`.
-A locked drive is also flagged in `radtest.py drives` and in the web UI, and its Start button is
-disabled.
+In the web UI a locked drive shows a **Recover…** button instead of Start: it runs exactly the same
+check, saves the same evidence and then prints the steps on the page (with the irreversible commands
+listed separately). Pressing it erases nothing. If the drive turns out to have the plain namespace
+write protection (feature 0x84) instead, the button clears that directly - no erase is involved.
 
 ## Steps per drive
 

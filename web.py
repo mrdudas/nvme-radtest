@@ -12,6 +12,7 @@ API:
   GET  /api/log?offset=N           new lines of radtest.log
   POST /api/report                 regenerate the summary report
   POST /api/start                  ask the watcher to start a test on a drive
+  POST /api/recover                check a read-only Micron drive and save the evidence
   POST /api/delete                 move one run into results/.trash (reversible)
   GET  /files/<path>               download a file from under results
 """
@@ -410,6 +411,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(409, {"error": info["in_use"]})
             who = f"web {self.client_address[0]}"
             radtest.enqueue_start(RESULTS, ctrl, ci["serial"], bool(body.get("retest")), source=who)
+            return self.send(200, {"ok": True, "ctrl": ctrl, "serial": ci["serial"]})
+        if u.path == "/api/recover":
+            # Only the read-only check + saving the evidence; the erase stays a manual step.
+            if not ALLOW_START:
+                return self.send(403, {"error": "this UI runs read-only (--read-only)"})
+            body = self.read_body()
+            ctrl, serial = str(body.get("ctrl", "")), body.get("serial")
+            if not re.fullmatch(r"nvme\d+", ctrl):
+                return self.send(400, {"error": "bad controller name"})
+            st = load(RESULTS / ".status.json") or {}
+            if st.get("running"):
+                return self.send(409, {"error": f"a test is already running on {st.get('ctrl')}"})
+            if not st.get("mode"):
+                return self.send(409, {"error": "the watcher is not running"})
+            ci = next((c for c in radtest.controllers(("pcie",)) if c["ctrl"] == ctrl), None)
+            if not ci:
+                return self.send(404, {"error": f"{ctrl} is not present"})
+            if serial and ci["serial"] != serial:
+                return self.send(409, {"error": "the drive changed, reload the page"})
+            radtest.enqueue_start(RESULTS, ctrl, ci["serial"], source=f"web {self.client_address[0]}",
+                                  action="recover")
             return self.send(200, {"ok": True, "ctrl": ctrl, "serial": ci["serial"]})
         if u.path == "/api/delete":
             if not ALLOW_START:

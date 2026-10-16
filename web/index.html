@@ -121,6 +121,12 @@ pre.text { background: var(--panel2); border-radius: 8px; padding: 12px; font-fa
 .hidden { display: none !important; }
 #driveDetail { scroll-margin-top: 70px; }
 #detected table { max-width: 1000px; margin: 0 auto; }
+#recovery .card { max-width: 1000px; margin: 0 auto; }
+#recovery code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.warnbox { background: var(--bad-soft); color: var(--bad); border-radius: 8px; padding: 8px 12px;
+  margin: 12px 0 8px; font-size: 13px; }
+ol.steps-ol { margin: 0 0 10px; padding-left: 22px; }
+ol.steps-ol li { margin: 5px 0; }
 #drivesTable tr.sub td { background: var(--panel2); font-size: 12px; }
 #drivesTable tr.grp + tr.sub td { border-top: 0; }
 .hist { margin-top: 3px; }
@@ -160,6 +166,7 @@ button.del:hover { color: var(--bad); }
       <div class="big" id="idleTitle">No test running</div>
       <div class="muted" id="idleSub"></div>
       <div id="detected" style="margin-top:22px;text-align:left"></div>
+      <div id="recovery" style="margin-top:18px;text-align:left"></div>
       <div id="idleLast" style="margin-top:18px"></div>
     </div>
     <div id="liveRun" class="grid cols-main hidden">
@@ -366,6 +373,7 @@ async function refreshStatus() {
       : auto ? "AUTO mode: every inserted drive is tested without asking."
       : "Insert an NVMe drive, then press Start on it below.";
     renderDetected(st.drives || [], s.allow_start !== false, auto);
+    renderRecovery(st.last_recovery);
     if (Date.now() - lastIdleFetch > 15000) {
       lastIdleFetch = Date.now();
       try {
@@ -455,7 +463,8 @@ function renderDetected(drives, allowStart, auto) {
       : auto ? `<span class="muted note">auto mode</span>`
       : !live ? `<span class="muted note">${esc(d.state)}</span>`
       : busy ? `<span class="muted note">protected</span>`
-      : ro ? `<span class="muted note">locked</span>`
+      : ro ? `<button class="primary" data-recover="${esc(d.ctrl)}" data-serial="${esc(d.serial)}"
+           data-model="${esc(d.model)}">Recover…</button>`
       : `<button class="${d.tested ? "" : "primary"}" data-start="${esc(d.ctrl)}" data-serial="${esc(d.serial)}"
            data-retest="${d.tested ? 1 : 0}" data-model="${esc(d.model)}" data-gb="${gb(d.size_bytes)}">
            ${d.tested ? "Test again" : "Start test"}</button>`;
@@ -464,6 +473,52 @@ function renderDetected(drives, allowStart, auto) {
   }).join("") + `</tbody>`;
   box.insertAdjacentHTML("beforeend", `<div id="startMsg"></div>`);
   box.querySelectorAll("button[data-start]").forEach(b => b.onclick = () => startTest(b));
+  box.querySelectorAll("button[data-recover]").forEach(b => b.onclick = () => recoverDrive(b));
+}
+
+async function recoverDrive(btn) {
+  const d = btn.dataset;
+  if (!confirm(`${d.model} (S/N ${d.serial}) is in firmware level read-only mode.\n\n` +
+      `This button does NOT erase anything. It checks whether an erase is the right answer, ` +
+      `saves everything the recovery would destroy (telemetry, persistent event log, SMART, ` +
+      `vendor logs) and then shows you the manual steps.\n\nRun the check now?`)) return;
+  btn.disabled = true;
+  const msg = $("#startMsg");
+  msg.textContent = "Checking the drive and saving the evidence…";
+  msg.style.color = "var(--muted)";
+  try {
+    const r = await fetch("/api/recover", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ctrl: d.recover, serial: d.serial }) });
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+    msg.textContent = "Running… the saved files and the steps appear below in a few seconds.";
+  } catch (e) {
+    msg.textContent = "Could not start the check: " + e.message;
+    msg.style.color = "var(--bad)";
+    btn.disabled = false;
+  }
+}
+
+function renderRecovery(rec) {
+  const box = $("#recovery");
+  if (!rec) { box.innerHTML = ""; return; }
+  const when = (rec.finished || rec.started || "").replace("T", " ").slice(0, 16);
+  if (rec.error && !rec.ok) {
+    box.innerHTML = `<div class="card" style="text-align:left"><h2>Micron recovery check</h2>
+      <div><b>${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b> <span class="muted">${esc(when)}</span></div>
+      <div class="${rec.not_locked ? "" : "nz"}" style="margin-top:6px">${esc(rec.error)}</div></div>`;
+    return;
+  }
+  box.innerHTML = `<div class="card" style="text-align:left">
+    <h2>Micron recovery – manual steps</h2>
+    <div><b>${esc(rec.model || "")} · ${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b>
+      <span class="muted">checked ${esc(when)}</span></div>
+    <div style="margin-top:8px">Everything the erase would destroy is saved:
+      <a href="/files/${encodeURI(rec.dir || "")}/recovery.json" target="_blank"><code>${esc(rec.dir || rec.saved_to || "")}</code></a></div>
+    <div class="warnbox">These steps <b>erase the whole drive</b> – run them yourself, in this order:</div>
+    <ol class="steps-ol">${(rec.steps || []).map(x => `<li><code>${esc(x)}</code></li>`).join("")}</ol>
+    <div class="muted">Never run: ${(rec.forbidden || []).map(x => `<code>${esc(x)}</code>`).join(", ")}
+      – those are irreversible.</div></div>`;
 }
 
 async function startTest(btn) {
