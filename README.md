@@ -68,22 +68,44 @@ is only erased after an explicit Start. Append `--auto` to the ExecStart line if
 inserted drive tested immediately. On stop the service receives SIGINT, so it closes the running
 test and restores the kernel parameters.
 
-## Write protection (Micron)
+## Write protection and the Micron read-only state
 
-A drive can come back from irradiation with its namespace write protected: every write is refused
-with NVMe status `SCT0/SC0x20 Namespace Is Write Protected`, the namespace reports NSATTR read-only
-and the kernel marks the block device read-only. radtest checks this after identify and before each
-write pass, and `nvblk` stops a write pass immediately instead of grinding through the whole drive.
+A drive can come back from irradiation unable to accept writes. There are two different cases and
+radtest treats them differently.
 
-On **Micron drives only** (PCI VID 0x1344) and **only when the namespace really is locked**, radtest
-clears the protection: `set-feature 0x84 = 0` (No Write Protect) followed by `ns-rescan`, then it
-re-reads every signal and continues the test. The attempt, the state before and after and the
-outcome all land in summary.json / summary.txt and in the verdict reasons.
+**1. NVMe namespace write protection** (feature 0x84). Writes are refused with
+`SCT0/SC0x20 Namespace Is Write Protected`, NSATTR reports read-only and the kernel marks the block
+device read-only. `nvblk` stops such a write pass at the first refusal instead of grinding through
+the whole drive. On **Micron drives only** (PCI VID 0x1344) and **only when the namespace really is
+locked**, radtest clears it with `set-feature 0x84 = 0` plus `ns-rescan`, re-reads every signal and
+repeats the write pass once (the blocked attempt is kept as `<label>_wp_blocked_*`). It never sets a
+protection, and it does not try to clear "write protect until power cycle" (only unplugging helps)
+or "permanent write protect" (irreversible) - those are reported and the test moves on.
 
-It never sets a protection, and it never tries to clear what cannot be cleared:
-"write protect until power cycle" (only unplugging helps) and "permanent write protect"
-(irreversible) are reported and the test moves on. If the drive put *itself* into read-only mode
-(SMART critical warning bit 3), that is a drive failure, not a software lock, so it is left alone.
+**2. Firmware level media read-only** - this is the state an irradiated Micron drive actually comes
+back in (see `docs/MICRON_RO_RECOVERY.md` of the Micron recovery work, verified on
+Micron_4150AT / A1MU002). Here feature 0x84 reads "No Write Protect" and is misleading; the real
+signals are SMART critical warning bit 3 (media placed in read-only mode) and NSATTR bit 0, and
+usually there is **no namespace block device at all** (namespace commands answer 0x2006). radtest
+detects this after identify - and also when a drive has no namespace, so the test stops with a clear
+reason instead of a bare "no namespace".
+
+radtest does **not** clear this one by itself: the only chain that works starts with a block erase
+that destroys every byte, and it needs a physical power cycle in the middle. Instead:
+
+```bash
+./radtest.py recover nvme0
+```
+
+checks that the drive really is in that state and that an erase is the right answer (it stops when
+another critical warning bit is set, when there are media errors, or when the available spare is
+below its threshold - then the drive is failing and an erase would only destroy the evidence),
+saves everything that the erase would wipe (controller telemetry, persistent event log, SMART,
+vendor logs, `msecli -P` if present) into `results/<serial>/<timestamp>-recovery/`, and prints the
+exact manual steps: `nvme sanitize -a 2 --ause` → poll `sanitize-log` until "Completed Successfully"
+→ power cycle (a controller reset is not enough) → `nvme attach-ns -n 1 -c 0` → `ns-rescan`.
+A locked drive is also flagged in `radtest.py drives` and in the web UI, and its Start button is
+disabled.
 
 ## Steps per drive
 

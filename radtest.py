@@ -171,7 +171,9 @@ def drive_info(results: Path, ci):
     busy = next((in_use(ns) for ns in nss if in_use(ns)), None)
     prev = previous_runs(results, ci["serial"]) if ci["serial"] else []
     done = [r for r in prev if r.get("status") == "completed"]
+    ro = micron_ro_state(ci["ctrl"]) if ci.get("state") == "live" else {}
     return dict(ci, namespaces=nss, size_bytes=ns_size_bytes(ci["ctrl"]), in_use=busy,
+                micron_read_only=bool(ro.get("locked")), micron_ro=ro or None,
                 runs=len(prev), tested=bool(done),
                 last_verdict=(done[-1] if done else (prev[-1] if prev else {})).get("verdict"),
                 last_run=(done[-1] if done else (prev[-1] if prev else {})).get("started"))
@@ -663,6 +665,36 @@ def write_protect_state(ctrl, ns, nsid=1):
     return st
 
 
+def micron_ro_state(ctrl, nsid=1):
+    """
+    Firmware level media read-only on Micron drives - the state an irradiated drive comes back in.
+    Reliable signals (see docs/MICRON_RO_RECOVERY.md): SMART critical warning bit 3 and NSATTR bit 0.
+    Feature 0x84 is misleading here: it reads "No Write Protect" while the drive is locked.
+    """
+    st = {"vendor_micron": as_int(rd(f"/sys/class/nvme/{ctrl}/device/vendor"), 0) in MICRON_VIDS}
+    sm = load_json(nvme(["smart-log", f"/dev/{ctrl}", "-o", "json", "--no-retries"], timeout=30)["stdout"]) or {}
+    cw = as_int(sm.get("critical_warning"), 0) or 0
+    st["critical_warning"] = cw
+    st["read_only_mode"] = bool(cw & 0x08)
+    st["other_warnings"] = cw & ~0x08
+    st["media_errors"] = as_int(sm.get("media_errors"))
+    st["avail_spare"] = as_int(sm.get("avail_spare"))
+    st["spare_thresh"] = as_int(sm.get("spare_thresh"))
+    st["eg_warning"] = as_int(sm.get("endurance_grp_critical_warning_summary"))
+    r = nvme(["id-ns", f"/dev/{ctrl}", "-n", str(nsid), "-o", "json", "--no-retries"], timeout=30)
+    idns = load_json(r["stdout"]) or {}
+    st["id_ns_rc"] = r["rc"]
+    st["nsattr"] = as_int(idns.get("nsattr"))
+    st["ns_write_protected"] = bool((st["nsattr"] or 0) & 1)
+    st["namespaces"] = namespaces(ctrl)
+    st["locked"] = bool(st["vendor_micron"] and (st["read_only_mode"] or st["ns_write_protected"]))
+    st["recoverable"] = bool(st["locked"] and not st["other_warnings"]
+                             and not (st["media_errors"] or 0)
+                             and (st["avail_spare"] is None or st["spare_thresh"] is None
+                                  or st["avail_spare"] >= st["spare_thresh"]))
+    return st
+
+
 def unlock_namespace(ctrl, ns, idn, log, nsid=1):
     """
     Clear a software write protection - Micron drives only, and only when the namespace
@@ -880,6 +912,17 @@ class DriveTest:
         self.step("identify and save logs (read-only)")
         nss = namespaces(self.ctrl)
         if not nss:
+            ro = micron_ro_state(self.ctrl)
+            self.S["micron_ro"] = ro
+            collect_logs(self.ctrl, None, self.dir / "logs" / "01_pre", None, first=True)
+            if ro["locked"]:
+                self.log("the drive is in firmware level read-only mode and has no usable namespace "
+                         f"(SMART critical warning 0x{ro['critical_warning']:02x}"
+                         f"{', NSATTR read-only' if ro['ns_write_protected'] else ''})", "ERR")
+                self.log("this is how an irradiated Micron drive comes back; only an erase clears it: "
+                         f"radtest.py recover {self.ctrl}", "WARN")
+                raise Aborted("Micron firmware read-only: no namespace, recovery needed "
+                              "(radtest.py recover)")
             raise Aborted("no namespace on the controller")
         self.ns = nss[0]
         if len(nss) > 1:
@@ -901,6 +944,12 @@ class DriveTest:
         self.S["supported_lids"] = p.get("supported_lids")
         self.S["identity_anomalies"] = identity_anomalies(idn, self.ci)
         self.print_identity()
+        ro = micron_ro_state(self.ctrl)
+        self.S["micron_ro"] = ro
+        if ro["locked"]:
+            self.log(f"Micron firmware read-only mode (SMART critical warning "
+                     f"0x{ro['critical_warning']:02x}): writes will be refused. Clearing it erases "
+                     f"the drive: radtest.py recover {self.ctrl}", "ERR")
         self.check_unlock("identify")
         self.step_done("identify", {})
 
@@ -1369,8 +1418,16 @@ def evaluate(S):
             phys.append(f"{name} self-test: {r['result_desc']}"
                         + (f" (LBA {r['failing_lba']})" if r.get("failing_lba") is not None else ""))
     cw = post.get("critical_warning") or pre.get("critical_warning")
+    ro = S.get("micron_ro") or {}
     for w in critical_warning_desc(cw):
-        (phys if "temperature" not in w else susp).append(f"SMART critical warning: {w}")
+        if "read-only" in w and ro.get("vendor_micron") and ro.get("recoverable"):
+            # Micron: firmware level media read-only, an erase clears it (see MICRON_RO_RECOVERY)
+            logical.append(f"SMART critical warning: {w} - on this Micron drive that is a firmware "
+                           "state, clearable with 'radtest.py recover' (which erases the drive)")
+        elif "temperature" in w:
+            susp.append(f"SMART critical warning: {w}")
+        else:
+            phys.append(f"SMART critical warning: {w}")
     if pre.get("media_errors") is not None and post.get("media_errors") is not None:
         d = post["media_errors"] - pre["media_errors"]
         if d > 0:
@@ -1666,6 +1723,101 @@ def report_row(S, d):
         "resets": (S.get("kernel") or {}).get("resets"),
         "date": (S.get("started") or "")[:16], "dir": str(d),
     }
+
+
+def cmd_recover(args):
+    """
+    Prepare the recovery of a Micron drive that came back in firmware level read-only mode.
+
+    radtest itself does not clear the lock: the only chain that works (see
+    docs/MICRON_RO_RECOVERY.md, verified on Micron_4150AT / A1MU002) starts with a block erase
+    that destroys every byte on the drive, and it needs a physical power cycle in the middle.
+    So this command checks that the drive really is in that state and that an erase is the right
+    answer, saves everything that would be lost (telemetry, persistent event log, SMART, vendor
+    logs), and then prints the exact commands for the operator to run.
+    """
+    results = Path(args.results)
+    results.mkdir(parents=True, exist_ok=True)
+    log = Log(results)
+    preflight(args, log)
+    ci = next((c for c in controllers(("pcie",)) if c["ctrl"] == args.ctrl), None)
+    if not ci:
+        sys.exit(f"{args.ctrl} not found")
+    ctrl, serial = ci["ctrl"], ci["serial"]
+    log.set_drive(None, f"[{ctrl} {serial}] ")
+    ro = micron_ro_state(ctrl)
+    if not ro["vendor_micron"]:
+        sys.exit("this is not a Micron drive - this procedure is only verified on Micron")
+    if not ro["locked"]:
+        log("the drive is not in read-only mode, there is nothing to recover", "OK")
+        return 0
+    log(f"firmware level read-only: SMART critical warning 0x{ro['critical_warning']:02x}, "
+        f"NSATTR {ro['nsattr']}, namespaces {ro['namespaces'] or 'none'}", "WARN")
+    if not ro["recoverable"]:
+        log(f"STOP: critical warning 0x{ro['critical_warning']:02x}, media errors "
+            f"{ro['media_errors']}, available spare {ro['avail_spare']}% (threshold "
+            f"{ro['spare_thresh']}%). Another warning bit or real media damage means the drive is "
+            "failing; an erase would only destroy the evidence.", "ERR")
+        return 2
+    for ns in ro["namespaces"]:
+        why = in_use(ns)
+        if why:
+            sys.exit(f"{why} - do not erase this drive")
+
+    d = results / safe_name(serial) / (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-recovery")
+    d.mkdir(parents=True, exist_ok=True)
+    log.set_drive(d / "recovery.log", f"[{ctrl} {serial}] ")
+    log.banner("saving the evidence of the locked state (the erase would destroy all of it)")
+    mp = ModParams(log)
+    mp.apply()
+    rec = {"tool": "radtest recover (preparation)", "ctrl": ctrl, "serial": serial,
+           "model": ci["model"], "started": dt.datetime.now().isoformat(timespec="seconds"),
+           "state": ro}
+    try:
+        rec["telemetry"] = collect_telemetry(ctrl, d / "telemetry", 0x08)
+        pel = d / "persistent-event-log"
+        pel.mkdir(exist_ok=True)
+        nvme(["persistent-event-log", f"/dev/{ctrl}", "-a", "1", "-o", "json", "--no-retries"],
+             out=pel / "establish.json", timeout=300)
+        nvme(["persistent-event-log", f"/dev/{ctrl}", "-a", "0", "-b", "--no-retries"],
+             out=pel / "pel.bin", binary=True, timeout=300)
+        nvme(["persistent-event-log", f"/dev/{ctrl}", "-a", "2", "--no-retries"], timeout=60)
+        collect_logs(ctrl, (ro["namespaces"] or [None])[0], d / "logs_before", MICRON_VIDS[0],
+                     first=True)
+        msecli = shutil.which("msecli")
+        if msecli:
+            run([msecli, "-P", str(d / "msecli.zip"), "-n", f"/dev/{ctrl}"], out=d / "msecli.log",
+                timeout=600)
+        rec["saved_to"] = str(d)
+    finally:
+        mp.restore()
+        (d / "recovery.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False, default=str))
+    log(f"saved: {d}", "OK")
+
+    log.banner("the recovery itself is a manual step - it ERASES THE WHOLE DRIVE")
+    for line in [
+        "The lock is in the firmware, and only a block erase clears it. radtest does not run this",
+        "for you. Run it yourself, in this order:",
+        "",
+        f"  1. nvme sanitize /dev/{ctrl} -a 2 --ause          # block erase, ~6 s, ERASES EVERYTHING",
+        f"  2. nvme sanitize-log /dev/{ctrl} -o json           # poll until the status is",
+        "                                                     # '(1) Completed Successfully'",
+        "                                                     # if it says '(3) failed': do NOT repeat,",
+        f"                                                     # run 'nvme sanitize /dev/{ctrl} -a 1'",
+        "  3. Power cycle the drive: unplug it and plug it back in.",
+        "     A controller reset is not enough. (On this rig 'switchtec hard-reset' also works,",
+        "     but that resets the whole switch, so every drive on it goes down.)",
+        f"  4. nvme attach-ns /dev/{ctrl} -n 1 -c 0",
+        f"  5. nvme ns-rescan /dev/{ctrl}",
+        "",
+        f"Then check it with: radtest.py recover {ctrl}   (it will say the drive is not locked)",
+        f"and start the test with: radtest.py start {ctrl}",
+        "",
+        "Never run: msecli -M -L, msecli -N -q without -w, msecli -M -R -P, permanent write",
+        "protect (-M -R -w), msecli -X -P, or any firmware download - those are irreversible.",
+    ]:
+        log(line)
+    return 0
 
 
 def cmd_report(args):
@@ -2011,7 +2163,10 @@ def cmd_drives(args):
         return 1
     print(f"{'CTRL':<8} {'MODEL':<28} {'SERIAL':<24} {'GB':>7}  {'STATE':<10} NOTE")
     for d in rows:
-        note = d["in_use"] or (f"already tested -> {d['last_verdict']}" if d["tested"] else "not tested yet")
+        note = (d["in_use"]
+                or ("READ-ONLY (Micron firmware lock) - radtest.py recover " + d["ctrl"]
+                    if d.get("micron_read_only") else None)
+                or (f"already tested -> {d['last_verdict']}" if d["tested"] else "not tested yet"))
         print(f"{d['ctrl']:<8} {d['model'][:28]:<28} {d['serial'][:24]:<24} "
               f"{gb(d['size_bytes']):>7.1f}  {d['state']:<10} {note}")
     return 0
@@ -2077,6 +2232,10 @@ def main():
     p = sub.add_parser("drives", help="list the detected NVMe drives")
     p.add_argument("--transport", nargs="+", default=["pcie"])
     p.set_defaults(func=cmd_drives)
+    p = sub.add_parser("recover", help="Micron drive stuck in read-only mode: check it, save the "
+                                       "evidence and print the manual recovery steps")
+    p.add_argument("ctrl", help="e.g. nvme0")
+    p.set_defaults(func=cmd_recover)
     p = sub.add_parser("status", help="state of the running test")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("report", help="summary report")
