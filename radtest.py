@@ -37,6 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 NVBLK = ROOT / "bin" / "nvblk"
 NVME = shutil.which("nvme") or "nvme"
+SWITCHTEC = shutil.which("switchtec") or "switchtec"
 SMARTCTL = shutil.which("smartctl")
 
 # for the duration of the test (only affects controllers attached afterwards)
@@ -130,12 +131,14 @@ class Log:
 REQ_DIR = ".requests"
 
 
-def enqueue_start(results: Path, ctrl, serial=None, retest=False, source="cli", action="start"):
-    """Queue a request for the watcher ("start" or "recover"). Returns the request file path."""
+def enqueue_start(results: Path, ctrl, serial=None, retest=False, source="cli", action="start",
+                  **extra):
+    """Queue a request for the watcher ("start", "recover" or "unlock")."""
     d = results / REQ_DIR
     d.mkdir(parents=True, exist_ok=True)
     req = {"action": action, "ctrl": ctrl, "serial": serial, "retest": bool(retest),
            "source": source, "created": dt.datetime.now().isoformat(timespec="seconds")}
+    req.update(extra)
     f = d / f"{time.time():.6f}-{safe_name(ctrl)}.json"
     f.write_text(json.dumps(req, ensure_ascii=False))
     return f
@@ -1858,6 +1861,394 @@ def cmd_recover(args):
 
 
 
+# ---------------------------------------------------------------------------
+# Micron firmware read-only: the unlock itself, start to finish
+# THE WHOLE DRIVE IS ERASED - the chain is docs/MICRON_RO_RECOVERY.md
+# ---------------------------------------------------------------------------
+
+UNLOCK_PHASES = ("check", "save evidence", "erase", "power cycle", "attach namespace", "verify")
+BDF_RE = r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d"
+
+
+def pci_bdf(ctrl):
+    """PCI address of a controller (0000:03:00.0), or None."""
+    b = os.path.basename(os.path.realpath(f"/sys/class/nvme/{ctrl}/device"))
+    return b if re.fullmatch(BDF_RE, b) else None
+
+
+def pci_parent(bdf):
+    """The bridge (downstream port) the device hangs off."""
+    b = os.path.basename(os.path.dirname(os.path.realpath(f"/sys/bus/pci/devices/{bdf}")))
+    return b if re.fullmatch(BDF_RE, b) else None
+
+
+def switchtec_of(bdf):
+    """
+    The switchtec management device of the switch this drive sits behind, if there is one.
+    The management endpoint is another function of the same PCI device as the switch's
+    upstream port (0000:01:00.1 next to 0000:01:00.0), so the drive's PCI path runs
+    through a sibling of it.
+    """
+    path = os.path.realpath(f"/sys/bus/pci/devices/{bdf}") + "/"
+    for sw in sorted(glob.glob("/sys/class/switchtec/switchtec*")):
+        swbdf = os.path.basename(os.path.realpath(f"{sw}/device"))
+        if not re.fullmatch(BDF_RE, swbdf):
+            continue
+        dev = swbdf.rsplit(".", 1)[0] + "."
+        if f"/{dev}" in path:
+            return {"dev": "/dev/" + os.path.basename(sw), "bdf": swbdf, "upstream": dev}
+    return None
+
+
+def ctrls_behind(prefix):
+    """Controllers whose PCI path runs through this device (0000:01:00.)."""
+    out = []
+    for p in sorted(glob.glob("/sys/class/nvme/nvme*")):
+        if f"/{prefix}" in os.path.realpath(f"{p}/device") + "/":
+            out.append(os.path.basename(p))
+    return out
+
+
+def ctrl_by_serial(serial):
+    """Find the drive again after a reset - the controller name can change."""
+    for p in sorted(glob.glob("/sys/class/nvme/nvme*")):
+        if rd(f"{p}/serial") == serial:
+            return os.path.basename(p)
+    return None
+
+
+def sysfs_write(path, value, log=None):
+    try:
+        Path(path).write_text(value)
+        return True
+    except OSError as ex:
+        if log:
+            log(f"{path}: {ex}", "WARN")
+        return False
+
+
+def wait_controller(serial, log, timeout=120, first_rescan=15):
+    """Wait for the drive to come back after a reset."""
+    t0 = time.time()
+    next_rescan = t0 + first_rescan
+    while time.time() - t0 < timeout:
+        c = ctrl_by_serial(serial)
+        if c and rd(f"/sys/class/nvme/{c}/state") == "live":
+            log(f"the drive is back as {c} ({fmt_dur(time.time() - t0)})", "OK")
+            return c
+        if time.time() > next_rescan:
+            next_rescan = time.time() + 30
+            log("re-scanning the PCI bus ...")
+            sysfs_write("/sys/bus/pci/rescan", "1", log)
+        time.sleep(2)
+    return None
+
+
+def power_cycle_drive(ctrl, serial, log, method="auto", allow_switch=True, verify=None,
+                      manual_wait=900):
+    """
+    Reset the drive deeply enough that the firmware hands the namespace back. A controller
+    reset is not enough (docs/MICRON_RO_RECOVERY.md), it needs a power cycle or a hard reset.
+
+      sbr     detach the endpoint and hot-reset its own downstream port - affects this drive only
+      switch  hard reset of the whole PCIe switch - the verified method, but every drive behind
+              the switch disappears for a moment
+      manual  the operator unplugs the drive and plugs it back in (no shell needed, just hands)
+
+    `verify(ctrl)` decides whether the reset was deep enough; with "auto" the next, stronger
+    method follows if it was not.
+    """
+    bdf = pci_bdf(ctrl)
+    sw = switchtec_of(bdf) if bdf else None
+    res = {"bdf": bdf, "switch": sw, "attempts": [], "ok": False, "ctrl": ctrl, "method": None}
+    if method == "auto":
+        order = ["sbr"] + (["switch"] if sw and allow_switch else []) + ["manual"]
+    else:
+        order = [method]
+    if sw:
+        res["switch_drives"] = ctrls_behind(sw["upstream"])
+    for how in order:
+        att = {"method": how, "started": dt.datetime.now().isoformat(timespec="seconds")}
+        res["attempts"].append(att)
+        cur = ctrl_by_serial(serial) or ctrl
+        bdf = pci_bdf(cur) or bdf
+        if how == "sbr":
+            bridge = pci_parent(bdf) if bdf else None
+            if not bridge:
+                att["error"] = "the PCI parent bridge was not found"
+                continue
+            log(f"detaching {bdf} and hot-resetting its port ({bridge})")
+            sysfs_write(f"/sys/bus/pci/devices/{bdf}/remove", "1", log)
+            time.sleep(2)
+            a = run(["setpci", "-s", bridge, "BRIDGE_CONTROL=40:40"], timeout=30)
+            time.sleep(0.5)
+            b = run(["setpci", "-s", bridge, "BRIDGE_CONTROL=00:40"], timeout=30)
+            att["setpci_rc"] = [a["rc"], b["rc"]]
+            time.sleep(3)
+            sysfs_write("/sys/bus/pci/rescan", "1", log)
+        elif how == "switch":
+            if not sw:
+                att["error"] = "no switchtec device belongs to this drive"
+                continue
+            others = [c for c in (res.get("switch_drives") or []) if c != cur]
+            log(f"hard-resetting the PCIe switch ({sw['dev']})"
+                + (f" - these drives go away with it for a moment: {', '.join(others)}" if others else ""),
+                "WARN")
+            if bdf:
+                sysfs_write(f"/sys/bus/pci/devices/{bdf}/remove", "1", log)
+                time.sleep(1)
+            st = run([SWITCHTEC, "hard-reset", sw["dev"], "--yes"], timeout=120)
+            att["rc"] = st["rc"]
+            att["out"] = ((st["stderr"] or st["stdout"]) or "").strip()[:200]
+            if st["rc"] != 0:
+                log(f"switchtec hard-reset: {att['out']}", "WARN")
+            time.sleep(5)
+            sysfs_write("/sys/bus/pci/rescan", "1", log)
+        elif how == "manual":
+            log("UNPLUG THE DRIVE AND PLUG IT BACK IN - waiting for it to come back", "WARN")
+            att["waiting_for_operator"] = True
+        else:
+            att["error"] = f"unknown method: {how}"
+            continue
+        back = wait_controller(serial, log, timeout=manual_wait if how == "manual" else 120)
+        att["ctrl"] = back
+        if not back:
+            att["error"] = "the drive did not come back"
+            log(f"the drive did not come back after the {how} reset", "ERR")
+            continue
+        res["ctrl"] = back
+        if verify is None or verify(back):
+            att["ok"] = True
+            res.update(ok=True, method=how)
+            return res
+        att["ok"] = False
+        log(f"the {how} reset was not deep enough, the namespace is still not there", "WARN")
+    return res
+
+
+def sanitize_status(ctrl):
+    data = get_log_raw(ctrl, 0x81, 512)
+    if not data or len(data) < 16:
+        return None
+    sprog, sstat = struct.unpack_from("<HH", data, 0)
+    return sstat & 0x7
+
+
+def wait_sanitize_ctrl(ctrl, log, on_progress=None, before=None, limit=1800):
+    """Poll the sanitize log: 'ok', 'failed', or the reason it did not finish."""
+    t0, last, seen_running, grace = time.time(), 0.0, False, 10
+    time.sleep(1)
+    while time.time() - t0 < limit:
+        if not os.path.exists(f"/sys/class/nvme/{ctrl}"):
+            return "the controller disappeared"
+        data = get_log_raw(ctrl, 0x81, 512)
+        if data and len(data) >= 16:
+            sprog, sstat = struct.unpack_from("<HH", data, 0)
+            s = sstat & 0x7
+            if s == 2:
+                seen_running = True
+            elif s == 3:
+                return "failed"
+            elif s in (1, 4) and (seen_running or s != before or time.time() - t0 > grace):
+                return "ok"
+            if time.time() - last > 5:
+                last = time.time()
+                pct = round(sprog * 100 / 65536, 1)
+                log(f"erase in progress: {pct}% ({fmt_dur(time.time() - t0)})")
+                if on_progress:
+                    on_progress(pct)
+        time.sleep(2)
+    return "timed out"
+
+
+class _TeeLog:
+    """Forwards to the real log and to the live status at the same time."""
+
+    def __init__(self, log, say):
+        self._log, self._say = log, say
+
+    def __call__(self, msg, level="INFO"):
+        self._say(str(msg), level)
+
+    def __getattr__(self, name):
+        return getattr(self._log, name)
+
+
+def micron_unlock_run(results: Path, ci, log, publish=None, power_cycle="auto",
+                      allow_switch=True, write_test=True):
+    """
+    Bring a Micron drive out of the firmware level read-only state, without a shell.
+    It ERASES THE WHOLE DRIVE: block erase, reset, re-attach the namespace, verify.
+    Everything the erase would destroy is saved first, and the same stop conditions apply
+    as for the check: another critical warning bit, media errors or a spare below the
+    threshold mean the drive is failing and nothing is erased.
+    """
+    serial = ci["serial"]
+    u = {"tool": "radtest unlock", "ctrl": ci["ctrl"], "serial": serial, "model": ci["model"],
+         "started": dt.datetime.now().isoformat(timespec="seconds"), "running": True,
+         "ok": False, "error": None, "phase": None, "messages": [],
+         "phases": [{"n": i + 1, "name": n, "state": "pending"} for i, n in enumerate(UNLOCK_PHASES)]}
+
+    def pub():
+        if publish:
+            try:
+                publish(json.loads(json.dumps(u, default=str)))
+            except Exception:  # noqa: BLE001  - the status file must never break the recovery
+                pass
+
+    def say(msg, level="INFO"):
+        log(msg, level)
+        u["messages"].append({"t": dt.datetime.now().strftime("%H:%M:%S"), "level": level,
+                              "msg": str(msg)})
+        del u["messages"][:-60]
+        pub()
+
+    def phase(name, state="running", msg=None, pct=None):
+        for p in u["phases"]:
+            if p["name"] == name:
+                p["state"], u["phase"] = state, (name if state == "running" else u["phase"])
+                if msg is not None:
+                    p["msg"] = msg
+                if pct is not None:
+                    p["pct"] = pct
+            elif state == "running" and p["state"] == "running":
+                p["state"] = "done"
+        pub()
+
+    def finish(ok, error=None, level=None):
+        u["ok"], u["error"], u["running"] = ok, error, False
+        u["finished"] = dt.datetime.now().isoformat(timespec="seconds")
+        for p in u["phases"]:
+            if p["state"] == "running":
+                p["state"] = "done" if ok else "failed"
+            elif p["state"] == "pending":
+                p["state"] = "skipped"
+        if error:
+            say(error, level or "ERR")
+        pub()
+        if u.get("saved_to"):
+            try:
+                (Path(u["saved_to"]) / "unlock.json").write_text(
+                    json.dumps(u, indent=1, ensure_ascii=False, default=str))
+            except OSError:
+                pass
+        return u
+
+    tee = _TeeLog(log, say)
+    phase("check")
+    try:
+        rec = micron_recover_prepare(results, ci, tee)
+    except Exception as ex:  # noqa: BLE001
+        return finish(False, f"the check failed: {type(ex).__name__}: {ex}")
+    u["recovery"] = {k: rec.get(k) for k in ("dir", "saved_to", "state", "ok", "not_locked", "unlock")}
+    u["dir"], u["saved_to"] = rec.get("dir"), rec.get("saved_to")
+    if rec.get("not_locked"):
+        phase("check", "done")
+        note = ("the namespace write protection (feature 0x84) is cleared, no erase was needed"
+                if rec.get("unlock", {}).get("unlocked") else
+                (rec.get("error") or "the drive is not locked, there is nothing to unlock"))
+        u["note"] = note
+        say(note, "OK")
+        return finish(True)
+    if not rec.get("ok"):
+        return finish(False, rec.get("error") or "the check failed")
+    phase("check", "done")
+    phase("save evidence", "done", msg=rec.get("dir"))
+
+    ctrl = ci["ctrl"]
+    d = Path(rec.get("saved_to") or (results / safe_name(serial)))
+    phase("erase", msg="block erase (sanitize)")
+    say("the block erase starts now - every byte on the drive goes with it", "WARN")
+    before = sanitize_status(ctrl)
+    r = nvme(["sanitize", f"/dev/{ctrl}", "-a", "2", "--ause", "--no-retries"], timeout=120,
+             out=d / "unlock" / "sanitize.txt")
+    if r["rc"] != 0:
+        return finish(False, "the erase command was refused: "
+                      + ((r["stderr"] or r["stdout"]) or "").strip()[:200])
+    res = wait_sanitize_ctrl(ctrl, say, lambda pct: phase("erase", "running", pct=pct), before=before)
+    if res == "failed":
+        say("the sanitize log says FAILED - leaving failure mode (sanitize -a 1); "
+            "it must not be repeated", "ERR")
+        nvme(["sanitize", f"/dev/{ctrl}", "-a", "1", "--no-retries"], timeout=60,
+             out=d / "unlock" / "sanitize-exit-failure.txt")
+        return finish(False, "the block erase failed (sanitize status 3) - this drive needs "
+                             "a different approach, do not repeat the erase")
+    if res != "ok":
+        return finish(False, f"the block erase did not finish: {res}")
+    phase("erase", "done", pct=100)
+    say("the block erase is done", "OK")
+
+    def attach(c):
+        phase("attach namespace")
+        a = nvme(["attach-ns", f"/dev/{c}", "-n", "1", "-c", "0"], timeout=60,
+                 out=d / "unlock" / "attach-ns.txt")
+        txt = ((a["stderr"] or a["stdout"]) or "").strip()[:160]
+        if a["rc"] != 0 and "already" not in txt.lower():
+            say(f"attach-ns is not possible yet: {txt}")
+            return False
+        nvme(["ns-rescan", f"/dev/{c}"], timeout=60)
+        time.sleep(3)
+        if namespaces(c):
+            phase("attach namespace", "done")
+            return True
+        return False
+
+    phase("power cycle")
+    pc = power_cycle_drive(ctrl, serial, say, method=power_cycle, allow_switch=allow_switch,
+                           verify=attach)
+    u["power_cycle"] = pc
+    ctrl = pc.get("ctrl") or ctrl
+    u["ctrl"] = ctrl
+    if not pc["ok"]:
+        return finish(False, "the drive did not come back writable after the reset - "
+                             "unplug it and plug it back in, then press Unlock again")
+    phase("power cycle", "done", msg=pc.get("method"))
+
+    phase("verify")
+    st = micron_ro_state(ctrl)
+    ns = (namespaces(ctrl) or [None])[0]
+    u["state_after"], u["namespace"] = st, ns
+    ro_flag = rd(f"/sys/block/{ns}/ro") if ns else None
+    ok = bool(ns and not st["locked"] and not st["critical_warning"] and ro_flag == "0")
+    if not ok:
+        return finish(False, f"it is still not writable: critical warning "
+                             f"0x{st['critical_warning']:02x}, NSATTR {st['nsattr']}, "
+                             f"namespace {ns or 'none'}, ro flag {ro_flag}")
+    if write_test:
+        wt = run(["dd", "if=/dev/zero", f"of=/dev/{ns}", "bs=4096", "count=1", "oflag=direct"],
+                 timeout=60)
+        u["write_test"] = {"rc": wt["rc"], "out": (wt["stderr"] or "").strip()[-200:]}
+        if wt["rc"] != 0:
+            return finish(False, "the drive still does not take writes: " + u["write_test"]["out"])
+        say("write test: the first block was written, the drive takes writes again", "OK")
+    phase("verify", "done")
+    say(f"UNLOCKED: /dev/{ns} is writable again ({gb(ns_size_bytes(ctrl)):.1f} GB). "
+        f"The drive is empty, it can be tested.", "OK")
+    return finish(True)
+
+
+def cmd_unlock(args):
+    """Unlock a read-only Micron drive - it erases the whole drive."""
+    results = Path(args.results)
+    results.mkdir(parents=True, exist_ok=True)
+    log = Log(results)
+    preflight(args, log)
+    ci = next((c for c in controllers(("pcie",)) if c["ctrl"] == args.ctrl), None)
+    if not ci:
+        sys.exit(f"{args.ctrl} not found")
+    st = load_json(rd(results / ".status.json")) or {}
+    if st.get("running"):
+        sys.exit(f"a test is running right now: {st.get('ctrl')} {st.get('serial')}")
+    if not args.yes:
+        print(f"This ERASES THE WHOLE DRIVE {ci['model']} (S/N {ci['serial']}).")
+        if input("Type the serial number to continue: ").strip() != ci["serial"]:
+            sys.exit("cancelled")
+    log.set_drive(None, f"[{ci['ctrl']} {ci['serial']}] ")
+    u = micron_unlock_run(results, ci, log, power_cycle=args.power_cycle,
+                          allow_switch=not args.no_switch_reset)
+    return 0 if u.get("ok") else 2
+
+
 def cmd_report(args):
     results = Path(args.results)
     runs = {}
@@ -2042,7 +2433,7 @@ def cmd_watch(args):
             "The kernel parameters do not apply to these (re-plugging is recommended).", "WARN")
     pci_baseline = set(nvme_pci_devices()) if "pcie" in transports else set()
     handled, waiting_since, dead_done, announced = set(), {}, set(), set()
-    last_recovery = None
+    last_recovery, last_unlock = None, None
     for f in (results / REQ_DIR).glob("*.json") if (results / REQ_DIR).is_dir() else []:
         f.unlink(missing_ok=True)  # stale requests from an earlier run
     for c in present.values():
@@ -2112,6 +2503,36 @@ def cmd_watch(args):
                         f"({req['serial']} != {c['serial']})", "WARN")
                     continue
                 key = (c["ctrl"], c["serial"])
+                if req.get("action") == "unlock":
+                    if req.get("confirm") != c["serial"]:
+                        log(f"unlock request for {c['ctrl']} ignored: the confirmation does not "
+                            f"match the serial number ({who})", "WARN")
+                        continue
+                    log(f"UNLOCK requested for {c['ctrl']} (S/N {c['serial']}) by {who} "
+                        f"- THIS ERASES THE DRIVE", "WARN")
+                    rows = [drive_info(results, x) for x in now.values()]
+
+                    def publish(u, rows=rows):
+                        write_status(results, running=False, waiting=True, busy="unlock",
+                                     mode="auto" if args.auto else "manual", drives=rows,
+                                     last_recovery=last_recovery, unlock=u)
+
+                    try:
+                        last_unlock = micron_unlock_run(
+                            results, c, log, publish=publish,
+                            power_cycle=req.get("power_cycle") or "auto",
+                            allow_switch=bool(req.get("allow_switch", True)))
+                    except Exception as ex:  # noqa: BLE001
+                        last_unlock = {"ok": False, "running": False, "ctrl": c["ctrl"],
+                                       "serial": c["serial"],
+                                       "error": f"{type(ex).__name__}: {ex}"}
+                        log(f"the unlock failed: {last_unlock['error']}", "ERR")
+                    # the controller name can change while the drive is reset
+                    present.pop(c["ctrl"], None)
+                    handled.discard((c["ctrl"], c["serial"]))
+                    announced.discard((c["ctrl"], c["serial"]))
+                    idle_msg = time.time()
+                    continue
                 if req.get("action") == "recover":
                     log(f"RECOVERY CHECK requested for {c['ctrl']} (S/N {c['serial']}) by {who}")
                     try:
@@ -2159,7 +2580,7 @@ def cmd_watch(args):
                 log("waiting for a drive ... (summary report: radtest.py report)")
             write_status(results, running=False, waiting=True, mode="auto" if args.auto else "manual",
                          drives=[drive_info(results, c) for c in now.values()],
-                         last_recovery=last_recovery)
+                         last_recovery=last_recovery, unlock=last_unlock)
             time.sleep(2)
     except KeyboardInterrupt:
         log("watcher stopped")
@@ -2286,6 +2707,17 @@ def main():
                                        "evidence and print the manual recovery steps")
     p.add_argument("ctrl", help="e.g. nvme0")
     p.set_defaults(func=cmd_recover)
+    p = sub.add_parser("unlock", help="Micron drive stuck in read-only mode: unlock it "
+                                      "(ERASES THE WHOLE DRIVE)")
+    p.add_argument("ctrl", help="e.g. nvme0")
+    p.add_argument("--yes", action="store_true", help="do not ask for the serial number")
+    p.add_argument("--power-cycle", choices=["auto", "sbr", "switch", "manual"], default="auto",
+                   help="how to reset the drive after the erase: sbr = its own PCIe port only, "
+                        "switch = hard reset of the whole switch, manual = you unplug it, "
+                        "auto = try them in that order")
+    p.add_argument("--no-switch-reset", action="store_true",
+                   help="never hard-reset the switch (it disturbs every drive behind it)")
+    p.set_defaults(func=cmd_unlock)
     p = sub.add_parser("status", help="state of the running test")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("report", help="summary report")

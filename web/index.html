@@ -55,6 +55,12 @@ button, .btn { font: inherit; border: 1px solid var(--line); background: var(--p
   padding: 6px 12px; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; }
 button:hover, .btn:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+button.danger:hover { filter: brightness(1.08); }
+.steps li.failed .ic { background: var(--bad-soft); color: var(--bad); }
+.steps li.failed { color: var(--bad); }
+.steps li.skipped { color: var(--muted); opacity: .55; }
+#unlockPanel .card { max-width: 1000px; margin: 0 auto; }
 main { max-width: 1400px; margin: 0 auto; padding: 20px; }
 .grid { display: grid; gap: 16px; }
 .cols-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
@@ -132,6 +138,8 @@ ol.steps-ol li { margin: 5px 0; }
 .hist { margin-top: 3px; }
 button.linkish { border: 0; background: none; color: var(--muted); padding: 0; font-size: 12px; cursor: pointer; }
 button.linkish:hover { color: var(--accent); }
+.caret::before { content: "\25b8"; }
+tr.open .caret::before { content: "\25be"; }
 td.delcol, th.delcol { width: 34px; padding-left: 4px; padding-right: 0; position: sticky; left: 0;
   background: var(--panel); }
 #drivesTable tr.sub td.delcol { background: var(--panel2); }
@@ -165,7 +173,11 @@ button.del:hover { color: var(--bad); }
       <div style="font-size:42px">💤</div>
       <div class="big" id="idleTitle">No test running</div>
       <div class="muted" id="idleSub"></div>
-      <div id="detected" style="margin-top:22px;text-align:left"></div>
+      <div id="detected" style="margin-top:22px;text-align:left">
+        <table id="detectedTable" class="hidden"></table>
+        <div id="startMsg"></div>
+      </div>
+      <div id="unlockPanel" style="margin-top:18px;text-align:left"></div>
       <div id="recovery" style="margin-top:18px;text-align:left"></div>
       <div id="idleLast" style="margin-top:18px"></div>
     </div>
@@ -266,6 +278,74 @@ const ERASE = { "sanitize-block": "sanitize (block erase)", "sanitize-crypto": "
   "nem támogatott": "not supported", "kihagyva": "skipped", "SIKERTELEN": "FAILED" };  // last three: legacy results
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
+// ---------- in-place DOM updates ----------
+// The page polls every two seconds. Rewriting the markup each time would throw
+// away the text selection, the hover state and the focus, so from here on every
+// dynamic part is updated field by field and lists are matched up by key.
+const setText = (e, v) => { const s = v == null ? "" : String(v); if (e && e.textContent !== s) { e._h = null; e.textContent = s; } };
+const setHTML = (e, h) => { if (e && e._h !== h) { e._h = h; e.innerHTML = h; } };
+const setCls = (e, c) => { if (e && e.className !== c) e.className = c; };
+const setAttr = (e, a, v) => { if (!e) return;
+  if (v == null) { if (e.hasAttribute(a)) e.removeAttribute(a); }
+  else if (e.getAttribute(a) !== String(v)) e.setAttribute(a, v); };
+const mk = (tag, cls, html) => { const e = document.createElement(tag);
+  if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+
+// Keep the children of `parent` in sync with `items`: a child whose key is
+// unchanged is kept (only its fields are rewritten), moved if the order
+// changed, and removed when its item is gone.
+function syncList(parent, items, key, create, update) {
+  const keep = new Map();
+  for (const node of [...parent.children]) {
+    const k = node.dataset ? node.dataset.k : null;
+    if (k == null || keep.has(k)) node.remove(); else keep.set(k, node);
+  }
+  let prev = null;
+  for (const it of items) {
+    const k = String(key(it));
+    let node = keep.get(k);
+    if (node) keep.delete(k); else { node = create(it); node.dataset.k = k; }
+    update(node, it);
+    const at = prev ? prev.nextElementSibling : parent.firstElementChild;
+    if (at !== node) parent.insertBefore(node, at);
+    prev = node;
+  }
+  for (const node of keep.values()) node.remove();
+}
+// definition list: one dt/dd pair per key, values updated in place
+function syncKV(dl, pairs) {
+  const have = dl._kv || (dl._kv = new Map()), seen = new Set();
+  let prev = null;
+  for (const [k, v] of pairs) {
+    seen.add(k);
+    let pr = have.get(k);
+    if (!pr) { pr = { dt: mk("dt"), dd: mk("dd") }; pr.dt.textContent = k; have.set(k, pr); }
+    setText(pr.dd, v);
+    const at = prev ? prev.nextSibling : dl.firstChild;
+    if (at !== pr.dt) dl.insertBefore(pr.dt, at);
+    if (pr.dt.nextSibling !== pr.dd) dl.insertBefore(pr.dd, pr.dt.nextSibling);
+    prev = pr.dd;
+  }
+  for (const [k, pr] of [...have]) if (!seen.has(k)) { pr.dt.remove(); pr.dd.remove(); have.delete(k); }
+}
+// a table whose header never changes: build it once, then work on the tbody
+function tbodyOf(table, head) {
+  if (!table._head) { table._head = 1; table.innerHTML = head + "<tbody></tbody>"; }
+  return table.tBodies[0];
+}
+// cells of one row; a null entry leaves that cell alone
+function setRow(tr, cells) {
+  if (tr.children.length !== cells.length) {
+    tr.innerHTML = ""; cells.forEach(() => tr.appendChild(mk("td")));
+  }
+  cells.forEach((c, i) => {
+    if (c === null) return;
+    const td = tr.children[i], o = (c && typeof c === "object") ? c : { t: c };
+    setCls(td, o.cls || "");
+    if ("h" in o) setHTML(td, o.h); else setText(td, o.t);
+  });
+}
+
 // ---------- theme ----------
 try { const t = localStorage.getItem("radtest-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
 $("#themeBtn").onclick = () => {
@@ -349,45 +429,56 @@ document.addEventListener("mousemove", ev => {
 
 // ---------- live view ----------
 let lastIoLabel = null, lastDirRel = null, lastLatFetch = 0, lastIdleFetch = 0;
-function statBox(v, l, cls = "") { return `<div class="stat ${cls}"><div class="v">${v}</div><div class="l">${l}</div></div>`; }
+const statBox = (v, l, cls = "") => `<div class="stat ${cls}"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+const DET_HEAD = `<thead><tr><th>Controller</th><th>Model</th><th>Serial</th><th class="num">GB</th>
+  <th>State</th><th>Status</th><th></th></tr></thead>`;
+const IO_HEAD = `<thead><tr><th>Step</th><th>Result</th><th class="num">MB/s</th><th class="num">Time</th>
+  <th class="num">Bad blocks</th><th class="num">Mismatch</th><th class="num">Ctrl err</th><th class="num">Slow</th>
+  <th class="num">p50 ms</th><th class="num">p99 ms</th><th class="num">max ms</th></tr></thead>`;
 
 async function refreshStatus() {
   let s;
-  try { s = await api("/api/status"); } catch (e) { $("#watchPill").className = "pill bad"; $("#watchPill span:last-child").textContent = "server unreachable"; return; }
-  $("#clock").textContent = s.now.slice(11, 19);
-  const st = s.status || {};
-  const wp = $("#watchPill");
-  if (st.running) { wp.className = "pill run"; wp.lastElementChild.textContent = "test running"; }
-  else if (s.watch_running) { wp.className = "pill ok"; wp.lastElementChild.textContent = "watcher active – waiting for drive"; }
-  else { wp.className = "pill warn"; wp.lastElementChild.textContent = "watcher not running"; }
-  document.title = st.running && st.progress && st.progress.pct != null
+  try { s = await api("/api/status"); }
+  catch (e) { setCls($("#watchPill"), "pill bad"); setText($("#watchPill").lastElementChild, "server unreachable"); return; }
+  setText($("#clock"), s.now.slice(11, 19));
+  const st = s.status || {}, wp = $("#watchPill");
+  if (st.running) { setCls(wp, "pill run"); setText(wp.lastElementChild, "test running"); }
+  else if (s.watch_running) { setCls(wp, "pill ok"); setText(wp.lastElementChild, "watcher active – waiting for drive"); }
+  else { setCls(wp, "pill warn"); setText(wp.lastElementChild, "watcher not running"); }
+  const title = st.running && st.progress && st.progress.pct != null
     ? `${st.progress.pct.toFixed(0)}% · radtest` : "radtest – NVMe inspection";
+  if (document.title !== title) document.title = title;
 
   const running = !!(st.running && s.steps);
   $("#liveIdle").classList.toggle("hidden", running);
   $("#liveRun").classList.toggle("hidden", !running);
-  if (!running) {
-    const auto = (st.mode || "manual") === "auto";
-    $("#idleTitle").textContent = s.watch_running ? "Waiting for a drive" : "No test running";
-    $("#idleSub").textContent = !s.watch_running ? "The watcher is not running. Start it with: ./radtest.py watch"
-      : auto ? "AUTO mode: every inserted drive is tested without asking."
-      : "Insert an NVMe drive, then press Start on it below.";
-    renderDetected(st.drives || [], s.allow_start !== false, auto);
-    renderRecovery(st.last_recovery);
-    if (Date.now() - lastIdleFetch > 15000) {
-      lastIdleFetch = Date.now();
-      try {
-        const rows = await api("/api/drives"), r = rows[0];
-        $("#idleLast").innerHTML = r ? `<span class="muted">Last test:</span> <a href="#drive=${encodeURIComponent(r.dir)}">${esc(r.model)} · ${esc(r.serial)}</a>
-          ${verdictPill(r.verdict)} <span class="muted">${esc((r.started || "").replace("T", " ").slice(0, 16))}</span>
-          <div><ul class="reasons" style="display:inline-block;text-align:left;max-width:900px">${(r.reasons || []).slice(0, 4).map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : "";
-      } catch (e) {}
-    }
-    return;
+  if (running) await renderRun(s, st); else await renderIdle(s, st);
+}
+
+async function renderIdle(s, st) {
+  const auto = (st.mode || "manual") === "auto";
+  setText($("#idleTitle"), s.watch_running ? "Waiting for a drive" : "No test running");
+  setText($("#idleSub"), !s.watch_running ? "The watcher is not running. Start it with: ./radtest.py watch"
+    : auto ? "AUTO mode: every inserted drive is tested without asking."
+    : "Insert an NVMe drive, then press Start on it below.");
+  renderDetected(st.drives || [], s.allow_start !== false, auto);
+  renderUnlock(st.unlock);
+  renderRecovery(st.last_recovery);
+  if (Date.now() - lastIdleFetch > 15000) {
+    lastIdleFetch = Date.now();
+    try {
+      const rows = await api("/api/drives"), r = rows[0];
+      setHTML($("#idleLast"), r ? `<span class="muted">Last test:</span> <a href="#drive=${encodeURIComponent(r.dir)}">${esc(r.model)} · ${esc(r.serial)}</a>
+        ${verdictPill(r.verdict)} <span class="muted">${esc((r.started || "").replace("T", " ").slice(0, 16))}</span>
+        <div><ul class="reasons" style="display:inline-block;text-align:left;max-width:900px">${(r.reasons || []).slice(0, 4).map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : "");
+    } catch (e) {}
   }
+}
+
+async function renderRun(s, st) {
   const id = s.identity || {}, sm = s.smart_pre || {}, pc = s.pcie || {};
-  $("#dModel").textContent = id.model || st.model || "–";
-  $("#dSerial").textContent = "S/N " + (id.serial || st.serial || "–");
+  setText($("#dModel"), id.model || st.model || "–");
+  setText($("#dSerial"), "S/N " + (id.serial || st.serial || "–"));
   const kv = [["Controller", st.ctrl], ["Firmware", id.firmware], ["Capacity", id.capacity_bytes ? gb(id.capacity_bytes) + " GB" : null],
     ["VID", id.vid != null ? "0x" + id.vid.toString(16).padStart(4, "0") : null],
     ["PCIe", pc.bdf ? `${pc.current_link_speed} x${pc.current_link_width}` : null],
@@ -397,32 +488,40 @@ async function refreshStatus() {
     ["Wear", sm.percent_used != null ? sm.percent_used + "%" : null],
     ["Temperature", sm.temperature_c != null ? sm.temperature_c + " °C" : null],
     ["Started", (st.started || "").replace("T", " ")]];
-  $("#dKv").innerHTML = kv.filter(x => x[1] != null && x[1] !== "").map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
-  $("#steps").innerHTML = s.steps.map(x => `<li class="${x.state}"><span class="ic">${x.state === "done" ? "✓" : x.n}</span>
-    <span>${esc(x.name)}</span><span class="d">${x.duration_s != null ? fmtDur(x.duration_s) : ""}</span></li>`).join("");
+  syncKV($("#dKv"), kv.filter(x => x[1] != null && x[1] !== ""));
+
+  syncList($("#steps"), s.steps, x => x.n,
+    () => { const li = mk("li"); li.append(mk("span", "ic"), mk("span"), mk("span", "d")); return li; },
+    (li, x) => { setCls(li, x.state); setText(li.children[0], x.state === "done" ? "✓" : x.n);
+      setText(li.children[1], x.name); setText(li.children[2], x.duration_s != null ? fmtDur(x.duration_s) : ""); });
 
   const p = st.progress;
   const curN = parseInt(st.step) || 0, curS = s.steps.find(x => x.n === curN);
-  $("#curStep").textContent = `${curN}/${s.steps.length} · ${curS ? curS.name : ""}`;
+  setText($("#curStep"), `${curN}/${s.steps.length} · ${curS ? curS.name : ""}`);
+  let meta = [], stats = [];
   if (p && p.done_lbas != null) {
     const bad = p.io_err_lbas + p.unbisected_lbas;
-    $("#curPct").textContent = p.pct.toFixed(1) + "%";
-    $("#curBar").style.width = p.pct + "%";
-    $("#curMeta").innerHTML = `<span>${gb(p.done_lbas * p.lba_size)} / ${gb(p.total_lbas * p.lba_size)} GB</span>
-      <span>${p.mb_s.toFixed(0)} MB/s</span><span>elapsed ${fmtDur(p.elapsed_s)}</span><span>remaining ${fmtDur(p.eta_s)}</span>`;
-    $("#curStats").innerHTML = statBox(bad, "bad blocks", bad ? "bad" : "") +
-      statBox(p.mismatch_lbas, "mismatched blocks", p.mismatch_lbas ? "bad" : "") +
-      statBox(p.ctrl_err_events, "controller errors", p.ctrl_err_events ? "warn" : "") +
-      statBox(p.slow_cmds, "slow commands", p.slow_cmds ? "warn" : "") +
-      statBox(ms(p.last_lat_us), "baseline latency (ms)");
+    setText($("#curPct"), p.pct.toFixed(1) + "%");
+    setStyleWidth($("#curBar"), p.pct + "%");
+    meta = [["size", `${gb(p.done_lbas * p.lba_size)} / ${gb(p.total_lbas * p.lba_size)} GB`],
+      ["rate", `${p.mb_s.toFixed(0)} MB/s`], ["elapsed", `elapsed ${fmtDur(p.elapsed_s)}`],
+      ["eta", `remaining ${fmtDur(p.eta_s)}`]];
+    stats = [["bad", bad, "bad blocks", bad ? "bad" : ""],
+      ["mis", p.mismatch_lbas, "mismatched blocks", p.mismatch_lbas ? "bad" : ""],
+      ["ctrl", p.ctrl_err_events, "controller errors", p.ctrl_err_events ? "warn" : ""],
+      ["slow", p.slow_cmds, "slow commands", p.slow_cmds ? "warn" : ""],
+      ["lat", ms(p.last_lat_us), "baseline latency (ms)", ""]];
   } else if (p && p.pct != null) {
-    $("#curPct").textContent = p.pct + "%"; $("#curBar").style.width = p.pct + "%";
-    $("#curMeta").innerHTML = p.elapsed_s != null ? `<span>elapsed ${fmtDur(p.elapsed_s)}</span>` : "";
-    $("#curStats").innerHTML = "";
+    setText($("#curPct"), p.pct + "%"); setStyleWidth($("#curBar"), p.pct + "%");
+    if (p.elapsed_s != null) meta = [["elapsed", `elapsed ${fmtDur(p.elapsed_s)}`]];
   } else {
-    $("#curPct").textContent = ""; $("#curBar").style.width = "0";
-    $("#curMeta").innerHTML = "<span>in progress…</span>"; $("#curStats").innerHTML = "";
+    setText($("#curPct"), ""); setStyleWidth($("#curBar"), "0");
+    meta = [["wait", "in progress…"]];
   }
+  syncList($("#curMeta"), meta, x => x[0], () => mk("span"), (sp, x) => setText(sp, x[1]));
+  syncList($("#curStats"), stats, x => x[0],
+    () => mk("div", "stat", `<div class="v"></div><div class="l"></div>`),
+    (d, x) => { setCls(d, ("stat " + (x[3] || "")).trim()); setText(d.children[0], x[1]); setText(d.children[1], x[2]); });
 
   // chart: active or last read/write step
   const label = s.io_label || (s.io_done.length ? s.io_done[s.io_done.length - 1].label : null);
@@ -431,49 +530,68 @@ async function refreshStatus() {
     const changed = label !== lastIoLabel || s.dir_rel !== lastDirRel;
     if (changed || (s.io_label && Date.now() - lastLatFetch > 4000)) {
       lastIoLabel = label; lastDirRel = s.dir_rel; lastLatFetch = Date.now();
-      $("#liveChartTitle").textContent = `Latency – ${s.io_name || s.io_done[s.io_done.length - 1].name}${s.io_label ? " (live)" : ""}`;
+      setText($("#liveChartTitle"), `Latency – ${s.io_name || s.io_done[s.io_done.length - 1].name}${s.io_label ? " (live)" : ""}`);
       try { drawChart($("#liveChart"), await api(`/api/latency?dir=${encodeURIComponent(s.dir_rel)}&label=${label}&points=500`), { slowMin: 20000 }); } catch (e) {}
     }
   }
-  $("#ioDone").innerHTML = s.io_done.length ? `<thead><tr><th>Step</th><th>Result</th><th class="num">MB/s</th><th class="num">Time</th>
-    <th class="num">Bad blocks</th><th class="num">Mismatch</th><th class="num">Ctrl err</th><th class="num">Slow</th>
-    <th class="num">p50 ms</th><th class="num">p99 ms</th><th class="num">max ms</th></tr></thead><tbody>` +
-    s.io_done.map(x => { const c = x.counts, bad = c.io_err_lbas + c.unbisected_err_lbas;
-      return `<tr><td>${esc(x.name)}</td><td>${x.result === "clean" ? '<span class="pill ok">clean</span>' : `<span class="pill bad">${esc(x.result)}</span>`}</td>
-      <td class="num">${x.mb_s.toFixed(0)}</td><td class="num">${fmtDur(x.elapsed_s)}</td>
-      <td class="num ${bad ? "nz" : ""}">${bad}</td><td class="num ${c.mismatch_lbas ? "nz" : ""}">${c.mismatch_lbas}</td>
-      <td class="num">${c.ctrl_err_events}</td><td class="num">${x.latency.slow_cmds}</td>
-      <td class="num">${ms(x.latency.p50)}</td><td class="num">${ms(x.latency.p99)}</td><td class="num">${ms(x.latency.max)}</td></tr>`; }).join("") + "</tbody>"
-    : `<tbody><tr><td class="muted">none yet</td></tr></tbody>`;
+  // a finished step never changes again, so its row is only rebuilt if it does
+  const rows = s.io_done.length ? s.io_done.map(x => ({ k: x.label, html: ioRow(x) }))
+    : [{ k: "-", html: `<td class="muted" colspan="11">none yet</td>` }];
+  syncList(tbodyOf($("#ioDone"), IO_HEAD), rows, x => x.k, () => mk("tr"), (tr, x) => setHTML(tr, x.html));
+}
+
+const setStyleWidth = (e, w) => { if (e && e.style.width !== w) e.style.width = w; };
+
+function ioRow(x) {
+  const c = x.counts, bad = c.io_err_lbas + c.unbisected_err_lbas;
+  return `<td>${esc(x.name)}</td><td>${x.result === "clean" ? '<span class="pill ok">clean</span>' : `<span class="pill bad">${esc(x.result)}</span>`}</td>
+    <td class="num">${x.mb_s.toFixed(0)}</td><td class="num">${fmtDur(x.elapsed_s)}</td>
+    <td class="num ${bad ? "nz" : ""}">${bad}</td><td class="num ${c.mismatch_lbas ? "nz" : ""}">${c.mismatch_lbas}</td>
+    <td class="num">${c.ctrl_err_events}</td><td class="num">${x.latency.slow_cmds}</td>
+    <td class="num">${ms(x.latency.p50)}</td><td class="num">${ms(x.latency.p99)}</td><td class="num">${ms(x.latency.max)}</td>`;
 }
 
 function renderDetected(drives, allowStart, auto) {
-  const box = $("#detected");
-  if (!drives.length) { box.innerHTML = ""; return; }
-  box.innerHTML = `<table><thead><tr><th>Controller</th><th>Model</th><th>Serial</th><th class="num">GB</th>
-    <th>State</th><th>Status</th><th></th></tr></thead><tbody>` + drives.map(d => {
+  const table = $("#detectedTable");
+  table.classList.toggle("hidden", !drives.length);
+  syncList(tbodyOf(table, DET_HEAD), drives, d => d.ctrl, () => mk("tr"), (tr, d) => {
     const busy = d.in_use, live = d.state === "live", ro = d.micron_read_only;
     const note = busy ? `<span class="pill bad">in use: ${esc(busy)}</span>`
       : ro ? `<span class="pill bad">read-only (Micron firmware lock)</span>
-          <span class="muted note">recovery erases the drive: <code>radtest.py recover ${esc(d.ctrl)}</code></span>`
+          <span class="muted note">Unlock erases the whole drive; Check only looks and saves</span>`
       : d.tested ? `<span class="pill ${VCLS[d.last_verdict] || ""}">tested · ${esc(VSHORT[d.last_verdict] || "?")}</span>
           <span class="muted note">${esc((d.last_run || "").replace("T", " ").slice(0, 16))}</span>`
       : `<span class="pill">not tested yet</span>`;
-    const btn = !allowStart ? `<span class="muted note">read-only UI</span>`
-      : auto ? `<span class="muted note">auto mode</span>`
-      : !live ? `<span class="muted note">${esc(d.state)}</span>`
-      : busy ? `<span class="muted note">protected</span>`
-      : ro ? `<button class="primary" data-recover="${esc(d.ctrl)}" data-serial="${esc(d.serial)}"
-           data-model="${esc(d.model)}">Recover…</button>`
-      : `<button class="${d.tested ? "" : "primary"}" data-start="${esc(d.ctrl)}" data-serial="${esc(d.serial)}"
-           data-retest="${d.tested ? 1 : 0}" data-model="${esc(d.model)}" data-gb="${gb(d.size_bytes)}">
-           ${d.tested ? "Test again" : "Start test"}</button>`;
-    return `<tr><td class="mono">${esc(d.ctrl)}</td><td>${esc(d.model)}</td><td class="mono">${esc(d.serial)}</td>
-      <td class="num">${gb(d.size_bytes)}</td><td>${esc(d.state)}</td><td>${note}</td><td>${btn}</td></tr>`;
-  }).join("") + `</tbody>`;
-  box.insertAdjacentHTML("beforeend", `<div id="startMsg"></div>`);
-  box.querySelectorAll("button[data-start]").forEach(b => b.onclick = () => startTest(b));
-  box.querySelectorAll("button[data-recover]").forEach(b => b.onclick = () => recoverDrive(b));
+    setRow(tr, [{ t: d.ctrl, cls: "mono" }, d.model, { t: d.serial, cls: "mono" },
+      { t: gb(d.size_bytes), cls: "num" }, d.state, { h: note }, null]);
+    // the action cell is only rebuilt when the offered action changes, so a
+    // button that was pressed stays disabled until the drive's state moves on
+    const kind = !allowStart ? "ro-ui" : auto ? "auto" : !live ? "state" : busy ? "busy" : ro ? "locked" : "start";
+    const label = kind === "start" ? (d.tested ? "Test again" : "Start test") : "";
+    const cell = tr.lastElementChild;
+    const sig = [kind, label, d.ctrl, d.serial, d.model, d.state, gb(d.size_bytes), d.tested ? 1 : 0].join("|");
+    if (cell._sig === sig) return;
+    cell._sig = sig; cell.innerHTML = "";
+    const data = { ctrl: d.ctrl, serial: d.serial, model: d.model, gb: gb(d.size_bytes) };
+    if (kind === "locked") {
+      // the drive is locked: unlocking erases it, so the check-only button stays next to it
+      const un = mk("button", "danger"); un.textContent = "Unlock…";
+      Object.assign(un.dataset, data); un.onclick = () => unlockDrive(un);
+      const ch = mk("button"); ch.textContent = "Check only";
+      Object.assign(ch.dataset, data); ch.onclick = () => recoverDrive(ch);
+      ch.style.marginLeft = "6px";
+      cell.append(un, ch);
+    } else if (kind === "start") {
+      const b = mk("button", d.tested ? "" : "primary");
+      b.textContent = label;
+      Object.assign(b.dataset, data, { retest: d.tested ? "1" : "0" });
+      b.onclick = () => startTest(b);
+      cell.appendChild(b);
+    } else {
+      cell.appendChild(mk("span", "muted note", kind === "ro-ui" ? "read-only UI"
+        : kind === "auto" ? "auto mode" : kind === "busy" ? "protected" : esc(d.state)));
+    }
+  });
 }
 
 async function recoverDrive(btn) {
@@ -488,7 +606,7 @@ async function recoverDrive(btn) {
   msg.style.color = "var(--muted)";
   try {
     const r = await fetch("/api/recover", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ctrl: d.recover, serial: d.serial }) });
+      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial }) });
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
     msg.textContent = "Running… the saved files and the steps appear below in a few seconds.";
@@ -499,17 +617,87 @@ async function recoverDrive(btn) {
   }
 }
 
+async function unlockDrive(btn) {
+  const d = btn.dataset;
+  const typed = prompt(`${d.model} (S/N ${d.serial}) is locked by its own firmware.\n\n` +
+    `UNLOCKING ERASES THE WHOLE DRIVE: block erase, reset, namespace attached again. ` +
+    `Everything the erase would destroy (telemetry, persistent event log, SMART, vendor logs) is ` +
+    `saved first, and it stops by itself if the drive turns out to be failing.\n\n` +
+    `The drive is then reset: first its own PCIe port, and if that is not deep enough, the whole ` +
+    `PCIe switch (every drive behind it blinks out for a moment). If even that is not enough, it ` +
+    `asks you to unplug the drive and plug it back in.\n\n` +
+    `Type the serial number to confirm:`);
+  if (typed == null) return;
+  if (typed.trim() !== d.serial) { alert("The serial number does not match – nothing was done."); return; }
+  btn.disabled = true;
+  const msg = $("#startMsg");
+  msg.textContent = "Unlock requested…"; msg.style.color = "var(--muted)";
+  try {
+    const r = await fetch("/api/unlock", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial, confirm: typed.trim() }) });
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+    msg.textContent = "Unlocking – the progress appears below.";
+    msg.style.color = "var(--muted)";
+  } catch (e) {
+    msg.textContent = "Could not start the unlock: " + e.message;
+    msg.style.color = "var(--bad)";
+    btn.disabled = false;
+  }
+}
+
+const UL_SKEL = `<div class="card" style="text-align:left">
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">Micron unlock</h2>
+    <span class="pill" id="ulPill"><span class="dot"></span><span></span></span></div>
+  <div id="ulHead" class="muted mono" style="margin-top:4px"></div>
+  <ul class="steps" id="ulPhases" style="margin-top:10px"></ul>
+  <div class="bar hidden" id="ulBarWrap" style="margin-top:10px"><div id="ulBar" style="width:0"></div></div>
+  <div id="ulMsg" style="margin-top:10px;font-weight:600"></div>
+  <div class="log" id="ulLog" style="height:150px;margin-top:10px"></div>
+  <div class="muted" id="ulFoot" style="margin-top:8px"></div></div>`;
+
+function renderUnlock(u) {
+  const box = $("#unlockPanel");
+  if (!u) { if (box._built) { box.innerHTML = ""; box._built = 0; } return; }
+  if (!box._built) { box.innerHTML = UL_SKEL; box._built = 1; }
+  const pill = $("#ulPill"), run = !!u.running;
+  setCls(pill, "pill " + (run ? "run" : u.ok ? "ok" : "bad"));
+  setText(pill.lastElementChild, run ? "unlocking…" : u.ok ? "unlocked" : "failed");
+  setText($("#ulHead"), `${u.model || ""} · ${u.ctrl} · S/N ${u.serial} · started ${(u.started || "").replace("T", " ")}` +
+    (u.finished ? ` · finished ${u.finished.slice(11)}` : ""));
+  syncList($("#ulPhases"), u.phases || [], x => x.n,
+    () => { const li = mk("li"); li.append(mk("span", "ic"), mk("span"), mk("span", "d")); return li; },
+    (li, x) => { setCls(li, x.state);
+      setText(li.children[0], x.state === "done" ? "✓" : x.state === "failed" ? "✕" : x.n);
+      setText(li.children[1], x.name);
+      setText(li.children[2], x.pct != null && x.state === "running" ? x.pct + "%" : (x.msg || "")); });
+  const er = (u.phases || []).find(x => x.name === "erase" && x.pct != null && x.state === "running");
+  $("#ulBarWrap").classList.toggle("hidden", !er);
+  if (er) { const w = er.pct + "%"; if ($("#ulBar").style.width !== w) $("#ulBar").style.width = w; }
+  const msg = $("#ulMsg");
+  setText(msg, u.error || u.note || (u.ok ? `Unlocked – /dev/${u.namespace || "?"} takes writes again, the drive is empty.` : ""));
+  setCls(msg, u.error ? "nz" : "");
+  syncList($("#ulLog"), (u.messages || []).map((m, i) => ({ ...m, i })), m => m.i, () => mk("div"),
+    (el, m) => { setCls(el, m.level === "ERR" ? "e" : m.level === "WARN" ? "w" : m.level === "OK" ? "o" : "");
+      setText(el, `${m.t}  ${m.msg}`); });
+  const lg = $("#ulLog"); lg.scrollTop = lg.scrollHeight;
+  const pc = u.power_cycle || {};
+  setHTML($("#ulFoot"), [u.dir ? `saved evidence: <a href="/files/${encodeURI(u.dir)}/recovery.json" target="_blank"><code>${esc(u.dir)}</code></a>` : "",
+    pc.method ? `reset: ${esc(pc.method)}` : "", u.write_test ? "write test passed" : ""].filter(Boolean).join(" · "));
+}
+
 function renderRecovery(rec) {
   const box = $("#recovery");
-  if (!rec) { box.innerHTML = ""; return; }
+  if (!rec) { setHTML(box, ""); return; }
   const when = (rec.finished || rec.started || "").replace("T", " ").slice(0, 16);
   if (rec.error && !rec.ok) {
-    box.innerHTML = `<div class="card" style="text-align:left"><h2>Micron recovery check</h2>
+    setHTML(box, `<div class="card" style="text-align:left"><h2>Micron recovery check</h2>
       <div><b>${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b> <span class="muted">${esc(when)}</span></div>
-      <div class="${rec.not_locked ? "" : "nz"}" style="margin-top:6px">${esc(rec.error)}</div></div>`;
+      <div class="${rec.not_locked ? "" : "nz"}" style="margin-top:6px">${esc(rec.error)}</div></div>`);
     return;
   }
-  box.innerHTML = `<div class="card" style="text-align:left">
+  setHTML(box, `<div class="card" style="text-align:left">
     <h2>Micron recovery – manual steps</h2>
     <div><b>${esc(rec.model || "")} · ${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b>
       <span class="muted">checked ${esc(when)}</span></div>
@@ -518,7 +706,7 @@ function renderRecovery(rec) {
     <div class="warnbox">These steps <b>erase the whole drive</b> – run them yourself, in this order:</div>
     <ol class="steps-ol">${(rec.steps || []).map(x => `<li><code>${esc(x)}</code></li>`).join("")}</ol>
     <div class="muted">Never run: ${(rec.forbidden || []).map(x => `<code>${esc(x)}</code>`).join(", ")}
-      – those are irreversible.</div></div>`;
+      – those are irreversible.</div></div>`);
 }
 
 async function startTest(btn) {
@@ -531,10 +719,10 @@ async function startTest(btn) {
   msg.textContent = "Start requested…"; msg.style.color = "var(--muted)";
   try {
     const r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ctrl: d.start, serial: d.serial, retest: d.retest === "1" }) });
+      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial, retest: d.retest === "1" }) });
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
-    msg.textContent = `Start requested for ${d.start} – the test begins in a few seconds.`;
+    msg.textContent = `Start requested for ${d.ctrl} – the test begins in a few seconds.`;
     msg.style.color = "var(--ok)";
   } catch (e) {
     msg.textContent = "Could not start: " + e.message;
@@ -542,7 +730,6 @@ async function startTest(btn) {
     btn.disabled = false;
   }
 }
-
 // ---------- log ----------
 let logOffset = -1;
 async function refreshLog() {
@@ -563,6 +750,12 @@ async function refreshLog() {
 const expanded = new Set();
 let expandInit = false;
 
+const DRIVES_HEAD = `<thead><tr><th class="delcol"></th><th>Date</th><th>S/N</th><th>Model / history</th><th>FW</th><th class="num">GB</th><th>Verdict</th>
+  <th class="num">POH</th><th class="num">Unsafe shutd.</th><th>Media err (pre>post)</th><th class="num" title="Pass 0: read errors in original content">P0 read</th>
+  <th class="num" title="Pass 1 write errors">P1 write</th><th class="num" title="Pass 1 read errors">P1 read</th><th class="num" title="Pass 1 mismatched blocks">P1 mism.</th><th>Erase</th>
+  <th class="num" title="Pass 2 (after erase) write errors">P2 write</th><th class="num" title="Pass 2 read errors">P2 read</th><th class="num" title="Pass 2 mismatched blocks">P2 mism.</th><th class="num">Slow</th>
+  <th class="num">Max ms</th><th class="num">Duration</th></tr></thead>`;
+
 async function loadDrives() {
   let rows; try { rows = await api("/api/drives"); } catch (e) { return; }
   // group the runs of one physical drive (same serial) together
@@ -575,7 +768,7 @@ async function loadDrives() {
   for (const list of groups.values()) list.sort((a, b) => (b.started || "").localeCompare(a.started || ""));
   const order = [...groups.entries()].sort((a, b) =>
     (b[1][0].started || "").localeCompare(a[1][0].started || ""));
-  $("#drivesCount").textContent = `${groups.size} drive${groups.size === 1 ? "" : "s"} · ${rows.length} run${rows.length === 1 ? "" : "s"}`;
+  setText($("#drivesCount"), `${groups.size} drive${groups.size === 1 ? "" : "s"} · ${rows.length} run${rows.length === 1 ? "" : "s"}`);
 
   const n = v => v === "-" || v == null ? `<td class="num muted">–</td>` : `<td class="num ${Number(v) ? "nz" : ""}">${v}</td>`;
   const cells = r => `<td class="mono">${esc(r.fw)}</td><td class="num">${esc(r.cap_gb)}</td>
@@ -588,7 +781,8 @@ async function loadDrives() {
         data-what="${esc(r.serial)} · ${when(r)} · ${esc(r.verdict)}">🗑</button>`}</td>`;
   const when = r => esc((r.started || "").replace("T", " ").slice(0, 16));
 
-  let body = "";
+  // one entry per table row; a row is only rebuilt when its own content changed
+  const items = [];
   for (const [key, list] of order) {
     // the drive's own result is the latest completed run; earlier ones are history
     const main = list.find(r => r.status === "completed") || list[0];
@@ -597,53 +791,60 @@ async function loadDrives() {
     if (!expandInit && rest.some(r => r.status !== "completed")) expanded.add(key);
     const open = expanded.has(key);
     const hist = rest.length
-      ? `<button class="linkish" data-toggle="${esc(key)}"><span class="caret">${open ? "▾" : "▸"}</span> ${rest.length} earlier run${rest.length === 1 ? "" : "s"}:
+      ? `<button class="linkish" data-toggle="${esc(key)}"><span class="caret"></span> ${rest.length} earlier run${rest.length === 1 ? "" : "s"}:
            ${rest.map(r => `<span class="pill ${VCLS[r.verdict] || ""}">${esc(VSHORT[r.verdict] || "?")}</span>`).join(" ")}</button>`
       : "";
-    body += `<tr class="click grp" data-dir="${esc(main.dir)}">${delCell(main)}<td>${when(main)}</td>
-      <td class="mono"><b>${esc(main.serial)}</b></td><td>${esc(main.model)}${hist ? `<div class="hist">${hist}</div>` : ""}</td>
-      ${cells(main)}</tr>`;
+    items.push({ key: main.dir, cls: "click grp" + (open ? " open" : ""), dir: main.dir, grp: null,
+      html: `${delCell(main)}<td>${when(main)}</td>
+        <td class="mono"><b>${esc(main.serial)}</b></td><td>${esc(main.model)}${hist ? `<div class="hist">${hist}</div>` : ""}</td>
+        ${cells(main)}` });
     for (const r of rest) {
-      body += `<tr class="click sub ${open ? "" : "hidden"}" data-grp="${esc(key)}" data-dir="${esc(r.dir)}">
-        ${delCell(r)}<td class="muted">↳ ${when(r)}</td><td class="muted mono">${esc(r.serial)}</td>
-        <td class="muted">${r.status === "completed" ? "earlier run" : `did not finish (${esc(r.status || "?")})`}</td>
-        ${cells(r)}</tr>`;
+      items.push({ key: r.dir, cls: "click sub" + (open ? "" : " hidden"), dir: r.dir, grp: key,
+        html: `${delCell(r)}<td class="muted">↳ ${when(r)}</td><td class="muted mono">${esc(r.serial)}</td>
+          <td class="muted">${r.status === "completed" ? "earlier run" : `did not finish (${esc(r.status || "?")})`}</td>
+          ${cells(r)}` });
     }
   }
   expandInit = true;
-  $("#drivesTable").innerHTML = `<thead><tr><th class="delcol"></th><th>Date</th><th>S/N</th><th>Model / history</th><th>FW</th><th class="num">GB</th><th>Verdict</th>
-    <th class="num">POH</th><th class="num">Unsafe shutd.</th><th>Media err (pre>post)</th><th class="num" title="Pass 0: read errors in original content">P0 read</th>
-    <th class="num" title="Pass 1 write errors">P1 write</th><th class="num" title="Pass 1 read errors">P1 read</th><th class="num" title="Pass 1 mismatched blocks">P1 mism.</th><th>Erase</th>
-    <th class="num" title="Pass 2 (after erase) write errors">P2 write</th><th class="num" title="Pass 2 read errors">P2 read</th><th class="num" title="Pass 2 mismatched blocks">P2 mism.</th><th class="num">Slow</th>
-    <th class="num">Max ms</th><th class="num">Duration</th></tr></thead><tbody>` + body + "</tbody>";
-
-  document.querySelectorAll("#drivesTable tr.click").forEach(tr => tr.onclick = ev => {
-    if (ev.target.closest("button[data-toggle]") || ev.target.closest("button[data-del]")) return;
-    location.hash = "drive=" + encodeURIComponent(tr.dataset.dir);
-  });
-  document.querySelectorAll("#drivesTable button[data-del]").forEach(b => b.onclick = async ev => {
-    ev.stopPropagation();
-    if (!confirm(`Remove this run from the results?\n\n${b.dataset.what}\n\n` +
-        `It is moved to results/.trash, so it can be restored, and it disappears from the report.`)) return;
-    b.disabled = true;
-    try {
-      const r = await fetch("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dir: b.dataset.del }) });
-      const j = await r.json();
-      if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
-      loadDrives();
-    } catch (e) { alert("Could not remove: " + e.message); b.disabled = false; }
-  });
-  document.querySelectorAll("#drivesTable button[data-toggle]").forEach(b => b.onclick = ev => {
-    ev.stopPropagation();
-    const key = b.dataset.toggle;
-    expanded.has(key) ? expanded.delete(key) : expanded.add(key);
-    document.querySelectorAll(`#drivesTable tr.sub[data-grp="${CSS.escape(key)}"]`)
-      .forEach(tr => tr.classList.toggle("hidden", !expanded.has(key)));
-    b.querySelector(".caret").textContent = expanded.has(key) ? "▾" : "▸";
+  syncList(tbodyOf($("#drivesTable"), DRIVES_HEAD), items, it => it.key, () => mk("tr"), (tr, it) => {
+    setCls(tr, it.cls);
+    setAttr(tr, "data-dir", it.dir);
+    setAttr(tr, "data-grp", it.grp);
+    setHTML(tr, it.html);
   });
 }
 
+// the handlers live on the table itself, so the rows can be replaced freely
+$("#drivesTable").onclick = async ev => {
+  const del = ev.target.closest("button[data-del]");
+  if (del) {
+    ev.stopPropagation();
+    if (!confirm(`Remove this run from the results?\n\n${del.dataset.what}\n\n` +
+        `It is moved to results/.trash, so it can be restored, and it disappears from the report.`)) return;
+    del.disabled = true;
+    try {
+      const r = await fetch("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dir: del.dataset.del }) });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+      loadDrives();
+    } catch (e) { alert("Could not remove: " + e.message); del.disabled = false; }
+    return;
+  }
+  const tog = ev.target.closest("button[data-toggle]");
+  if (tog) {
+    ev.stopPropagation();
+    const key = tog.dataset.toggle;
+    expanded.has(key) ? expanded.delete(key) : expanded.add(key);
+    const open = expanded.has(key);
+    document.querySelectorAll(`#drivesTable tr.sub[data-grp="${CSS.escape(key)}"]`)
+      .forEach(tr => tr.classList.toggle("hidden", !open));
+    tog.closest("tr").classList.toggle("open", open);
+    return;
+  }
+  const tr = ev.target.closest("tr.click");
+  if (tr) location.hash = "drive=" + encodeURIComponent(tr.dataset.dir);
+};
 async function showDrive(dir) {
   const box = $("#driveDetail");
   let d; try { d = await api(`/api/drive?dir=${encodeURIComponent(dir)}`); } catch (e) { box.innerHTML = `<div class="card">Not found: ${esc(dir)}</div>`; box.classList.remove("hidden"); return; }
@@ -715,15 +916,15 @@ async function loadReport(regen) {
     $("#reportBtn").disabled = false; $("#reportBtn").textContent = "Regenerate report"; }
   try {
     const r = await fetch("/files/REPORT.txt");
-    $("#reportText").textContent = r.ok ? await r.text() : "No report yet – click “Regenerate report”.";
+    setText($("#reportText"), r.ok ? await r.text() : "No report yet – click “Regenerate report”.");
   } catch (e) {}
   try {
     const rows = await api("/api/drives"), latest = {};
     for (const r of rows) if (!latest[r.serial] || (r.status === "completed" && latest[r.serial].status !== "completed")) latest[r.serial] = r;
     const cnt = {}; Object.values(latest).forEach(r => cnt[r.verdict] = (cnt[r.verdict] || 0) + 1);
     const cls = { OK: "", SUSPECT: "warn", LOGICAL: "bad", PHYSICAL: "bad", DEAD: "bad", INCOMPLETE: "warn" };
-    $("#reportStats").innerHTML = statBox(Object.keys(latest).length, Object.keys(latest).length === 1 ? "drive" : "drives") +
-      ["OK", "SUSPECT", "LOGICAL", "PHYSICAL", "DEAD", "INCOMPLETE"].filter(k => cnt[k]).map(k => statBox(cnt[k], VSHORT[k], cls[k])).join("");
+    setHTML($("#reportStats"), statBox(Object.keys(latest).length, Object.keys(latest).length === 1 ? "drive" : "drives") +
+      ["OK", "SUSPECT", "LOGICAL", "PHYSICAL", "DEAD", "INCOMPLETE"].filter(k => cnt[k]).map(k => statBox(cnt[k], VSHORT[k], cls[k])).join(""));
   } catch (e) {}
 }
 $("#reportBtn").onclick = () => loadReport(true);
@@ -731,9 +932,12 @@ $("#reportBtn").onclick = () => loadReport(true);
 // ---------- start ----------
 route();
 refreshStatus(); refreshLog();
-setInterval(refreshStatus, 2000);
-setInterval(refreshLog, 2000);
-setInterval(() => { if (tab === "drives" && !location.hash.startsWith("#drive=")) loadDrives(); }, 15000);
+// nothing is polled while the page is in the background
+const tick = () => { if (document.hidden) return; refreshStatus(); refreshLog(); };
+setInterval(tick, 2000);
+setInterval(() => { if (!document.hidden && tab === "drives" && !location.hash.startsWith("#drive=")) loadDrives(); }, 15000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+
 </script>
 </body>
 </html>

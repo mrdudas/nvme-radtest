@@ -12,6 +12,7 @@ make                           # build bin/nvblk (once)
 ./radtest.py start nvme0       # start the test on that drive (same as the Start button)
 ./radtest.py status            # from another terminal: where the test currently is
 ./radtest.py report            # once every drive is done: results/REPORT.{txt,md,csv}
+./radtest.py unlock nvme0      # read-only Micron drive: unlock it (ERASES THE DRIVE)
 ./radtest.py run nvme0         # test one drive directly, without the watcher
 ./radtest.py watch --auto      # old behaviour: test every inserted drive immediately
 ```
@@ -42,7 +43,11 @@ which erases a drive**. Bind it to localhost (`--bind 127.0.0.1`, reach it over 
 run it with `--read-only` if that is not acceptable.
 - **Live test:** when idle, the detected drives with their Start buttons (model, serial, size, and
   whether they were tested before); while a test runs, drive data, state of the 11 steps, progress
-  bar, throughput, remaining time, error counters, live latency chart, log.
+  bar, throughput, remaining time, error counters, live latency chart, log. A drive that came back
+  locked gets **Unlock…** and **Check only** instead of Start, and the unlock reports its progress
+  on the page, phase by phase.
+  Nothing on the page is redrawn on a whole: the status is polled every two seconds, but only the
+  fields that actually changed are rewritten, so selection, hover and scrolling are never lost.
 - **Drives:** the runs are grouped by serial number, one row per physical drive, showing its latest
   completed run. Earlier runs are listed under it with their verdicts, so it is visible when a test
   misran and had to be repeated; a drive with an unfinished earlier run is expanded by default.
@@ -90,24 +95,32 @@ usually there is **no namespace block device at all** (namespace commands answer
 detects this after identify - and also when a drive has no namespace, so the test stops with a clear
 reason instead of a bare "no namespace".
 
-radtest does **not** clear this one by itself: the only chain that works starts with a block erase
-that destroys every byte, and it needs a physical power cycle in the middle. Instead:
+Clearing this one **erases the whole drive**: the only chain that works starts with a block erase
+and needs a reset deeper than a controller reset. radtest can do all of it, so no shell is needed:
 
 ```bash
-./radtest.py recover nvme0
+./radtest.py recover nvme0     # check only: save the evidence, print the steps, erase nothing
+./radtest.py unlock nvme0      # the whole chain, start to finish - ERASES THE DRIVE
 ```
 
-checks that the drive really is in that state and that an erase is the right answer (it stops when
-another critical warning bit is set, when there are media errors, or when the available spare is
-below its threshold - then the drive is failing and an erase would only destroy the evidence),
-saves everything that the erase would wipe (controller telemetry, persistent event log, SMART,
-vendor logs, `msecli -P` if present) into `results/<serial>/<timestamp>-recovery/`, and prints the
-exact manual steps: `nvme sanitize -a 2 --ause` → poll `sanitize-log` until "Completed Successfully"
-→ power cycle (a controller reset is not enough) → `nvme attach-ns -n 1 -c 0` → `ns-rescan`.
-In the web UI a locked drive shows a **Recover…** button instead of Start: it runs exactly the same
-check, saves the same evidence and then prints the steps on the page (with the irreversible commands
-listed separately). Pressing it erases nothing. If the drive turns out to have the plain namespace
-write protection (feature 0x84) instead, the button clears that directly - no erase is involved.
+In the web UI a locked drive shows **Unlock…** and **Check only** instead of Start. Unlock asks for
+the drive's serial number to be typed back, and then runs:
+
+| # | Phase | What happens |
+|---|---|---|
+| 1 | check | Micron drive, really locked, and an erase is the right answer. It **stops** when another critical warning bit is set, when there are media errors, or when the available spare is below its threshold - the drive is then failing and an erase would only destroy the evidence. A plain namespace write protection (feature 0x84) is cleared here directly, with no erase. |
+| 2 | save evidence | Everything the erase would wipe: controller telemetry, persistent event log, SMART, vendor logs, `msecli -P` if present → `results/<serial>/<timestamp>-recovery/` |
+| 3 | erase | `nvme sanitize -a 2 --ause`, polling the sanitize log with a progress bar. If the log says "failed", it leaves failure mode (`sanitize -a 1`) and stops instead of repeating the erase. |
+| 4 | power cycle | The firmware only hands the namespace back after a deep reset. It tries the least invasive first: **sbr** = detach the endpoint and hot-reset its own PCIe port; then **switch** = `switchtec hard-reset` of the whole switch (every drive behind it disappears for a moment); then **manual** = it asks on the page for the drive to be unplugged and plugged back in, and waits for it. `--power-cycle sbr|switch|manual` forces one, `--no-switch-reset` keeps the switch out of it. |
+| 5 | attach namespace | `nvme attach-ns -n 1 -c 0` + `ns-rescan`; this is what decides whether the reset was deep enough. |
+| 6 | verify | critical warning 0, NSATTR 0, the block device is back with `ro=0`, and one block is actually written. |
+
+The drive's controller name may change along the way (the reset re-enumerates it); the drive is
+followed by serial number. The progress, every message and the result appear on the page while it
+runs, and are saved into `unlock.json` next to the evidence.
+
+It never runs the irreversible commands (`msecli -M -L`, `msecli -X -P`, permanent write protect,
+firmware download/commit) - those are listed on the page as the ones never to use.
 
 ## Steps per drive
 
