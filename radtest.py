@@ -175,8 +175,12 @@ def drive_info(results: Path, ci):
     prev = previous_runs(results, ci["serial"]) if ci["serial"] else []
     done = [r for r in prev if r.get("status") == "completed"]
     ro = micron_ro_state(ci["ctrl"]) if ci.get("state") == "live" else {}
+    # only when there is nothing to work with: a drive whose namespace is missing or detached
+    ns = namespace_state(ci["ctrl"]) if (ci.get("state") == "live" and not nss) else None
     return dict(ci, namespaces=nss, size_bytes=ns_size_bytes(ci["ctrl"]), in_use=busy,
                 micron_read_only=bool(ro.get("locked")), micron_ro=ro or None,
+                no_namespace=bool(ns), ns_detached=(ns or {}).get("detached") or [],
+                ns_fixable=bool((ns or {}).get("fixable")), ns_state=ns,
                 runs=len(prev), tested=bool(done),
                 last_verdict=(done[-1] if done else (prev[-1] if prev else {})).get("verdict"),
                 last_run=(done[-1] if done else (prev[-1] if prev else {})).get("started"))
@@ -2249,6 +2253,208 @@ def cmd_unlock(args):
     return 0 if u.get("ok") else 2
 
 
+# ---------------------------------------------------------------------------
+# A drive without a usable namespace: attach the one it has, or create one
+# ---------------------------------------------------------------------------
+
+NS_PHASES = ("check", "create namespace", "attach namespace", "verify")
+
+
+def ns_id_list(args):
+    """Namespace IDs from a 'nvme list-ns' output (json first, text as a fallback)."""
+    r = nvme(args + ["-o", "json", "--no-retries"], timeout=30)
+    data = load_json(r["stdout"])
+    if isinstance(data, dict):
+        ids = [as_int(x.get("nsid") if isinstance(x, dict) else x)
+               for x in (data.get("nsid_list") or data.get("nsids") or [])]
+        ids = [i for i in ids if i]
+        if ids or r["rc"] == 0:
+            return sorted(set(ids))
+    txt = nvme(args + ["--no-retries"], timeout=30)["stdout"]
+    return sorted({int(m, 0) for m in re.findall(r"\]:\s*(0x[0-9a-fA-F]+|\d+)", txt)})
+
+
+def namespace_state(ctrl):
+    """
+    What namespaces this controller has. "active" ones are attached and usable,
+    "allocated" ones exist on the drive but may be detached - after a sanitize
+    recovery that is exactly where a namespace gets stuck.
+    """
+    idc = load_json(nvme(["id-ctrl", f"/dev/{ctrl}", "-o", "json", "--no-retries"],
+                         timeout=30)["stdout"]) or {}
+    st = {"ctrl": ctrl,
+          "cntlid": as_int(idc.get("cntlid"), 0) or 0,
+          "ns_management": bool((as_int(idc.get("oacs"), 0) or 0) & 0x8),
+          "tnvmcap": as_int(idc.get("tnvmcap")),
+          "unvmcap": as_int(idc.get("unvmcap")),
+          "max_namespaces": as_int(idc.get("nn")),
+          "block_devices": namespaces(ctrl)}
+    st["active"] = ns_id_list(["list-ns", f"/dev/{ctrl}"])
+    st["allocated"] = ns_id_list(["list-ns", f"/dev/{ctrl}", "-a"])
+    st["detached"] = [n for n in st["allocated"] if n not in st["active"]]
+    st["details"] = {}
+    for n in st["allocated"][:8]:
+        idn = load_json(nvme(["id-ns", f"/dev/{ctrl}", "-n", str(n), "--force", "-o", "json",
+                              "--no-retries"], timeout=30)["stdout"]) or {}
+        lbafs = idn.get("lbafs") or []
+        cur = as_int(idn.get("flbas"), 0) or 0
+        ds = next((as_int(f.get("ds")) for i, f in enumerate(lbafs) if i == (cur & 0xF)), None)
+        st["details"][n] = {"nsze": as_int(idn.get("nsze")), "nvmcap": as_int(idn.get("nvmcap")),
+                            "flbas": cur, "block_size": (1 << ds) if ds else None,
+                            "nsattr": as_int(idn.get("nsattr")),
+                            "controllers": ns_id_list(["list-ctrl", f"/dev/{ctrl}", "-n", str(n)])}
+    st["usable"] = bool(st["block_devices"])
+    st["fixable"] = bool(not st["usable"] and (st["detached"] or st["ns_management"]))
+    return st
+
+
+def namespace_fix(results: Path, ci, log, publish=None, nsid=None, block_size=None, nsze=None):
+    """
+    Give a drive a usable namespace again. Two cases:
+      - the namespace exists but is detached (a sanitize recovery stopped half way)
+        -> attach it, nothing is created and nothing is erased
+      - the drive has no namespace at all -> create one over the free capacity, then attach it
+    Neither step writes user data. A drive that already has a namespace is left alone.
+    """
+    ctrl = ci["ctrl"]
+    u = {"tool": "radtest namespace", "ctrl": ctrl, "serial": ci["serial"], "model": ci["model"],
+         "started": dt.datetime.now().isoformat(timespec="seconds"), "running": True,
+         "ok": False, "error": None, "phase": None, "messages": [],
+         "phases": [{"n": i + 1, "name": n, "state": "pending"} for i, n in enumerate(NS_PHASES)]}
+
+    def pub():
+        if publish:
+            try:
+                publish(json.loads(json.dumps(u, default=str)))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def say(msg, level="INFO"):
+        log(msg, level)
+        u["messages"].append({"t": dt.datetime.now().strftime("%H:%M:%S"), "level": level,
+                              "msg": str(msg)})
+        del u["messages"][:-40]
+        pub()
+
+    def phase(name, state="running", msg=None):
+        for p in u["phases"]:
+            if p["name"] == name:
+                p["state"] = state
+                if state == "running":
+                    u["phase"] = name
+                if msg is not None:
+                    p["msg"] = msg
+            elif state == "running" and p["state"] == "running":
+                p["state"] = "done"
+        pub()
+
+    def finish(ok, error=None):
+        u["ok"], u["error"], u["running"] = ok, error, False
+        u["finished"] = dt.datetime.now().isoformat(timespec="seconds")
+        for p in u["phases"]:
+            if p["state"] == "running":
+                p["state"] = "done" if ok else "failed"
+            elif p["state"] == "pending":
+                p["state"] = "skipped"
+        if error:
+            say(error, "ERR")
+        pub()
+        return u
+
+    phase("check")
+    st = namespace_state(ctrl)
+    u["state_before"] = st
+    if st["usable"]:
+        phase("check", "done")
+        u["note"] = f"the drive already has a namespace: /dev/{st['block_devices'][0]}"
+        say(u["note"], "OK")
+        return finish(True)
+    say(f"no usable namespace: allocated {st['allocated'] or 'none'}, "
+        f"active {st['active'] or 'none'}, namespace management "
+        f"{'supported' if st['ns_management'] else 'NOT supported'}", "WARN")
+
+    target = nsid or (st["detached"][0] if st["detached"] else None)
+    if target:
+        det = st["details"].get(target, {})
+        phase("create namespace", "skipped")
+        say(f"namespace {target} is there ({gb(det.get('nvmcap') or 0):.1f} GB, "
+            f"{det.get('block_size') or '?'} B blocks), it is only detached - attaching it")
+    else:
+        if not st["ns_management"]:
+            phase("check", "failed")
+            return finish(False, "this drive has no namespace and the controller does not support "
+                                 "namespace management - it needs a format or the vendor tool")
+        phase("create namespace")
+        bs = block_size or 4096
+        cap = nsze * bs if nsze else (st["unvmcap"] or st["tnvmcap"] or 0)
+        if not cap:
+            return finish(False, "the drive reports no free capacity to create a namespace from")
+        blocks = nsze or cap // bs
+        say(f"creating a namespace: {blocks} blocks x {bs} B = {gb(blocks * bs):.1f} GB")
+        r = nvme(["create-ns", f"/dev/{ctrl}", "-s", str(blocks), "-c", str(blocks),
+                  "-b", str(bs), "-d", "0", "-m", "0", "--no-retries"], timeout=120)
+        out = ((r["stdout"] or "") + " " + (r["stderr"] or "")).strip()
+        u["create_out"] = out[:300]
+        if r["rc"] != 0:
+            return finish(False, f"create-ns failed: {out[:200]}")
+        m = re.search(r"nsid[:\s]+(\d+)", out, re.I)
+        target = int(m.group(1)) if m else (ns_id_list(["list-ns", f"/dev/{ctrl}", "-a"]) or [1])[-1]
+        say(f"namespace {target} created", "OK")
+        phase("create namespace", "done")
+
+    phase("attach namespace")
+    u["nsid"] = target
+    r = nvme(["attach-ns", f"/dev/{ctrl}", "-n", str(target), "-c", str(st["cntlid"]),
+              "--no-retries"], timeout=60)
+    out = ((r["stdout"] or "") + " " + (r["stderr"] or "")).strip()
+    u["attach_out"] = out[:300]
+    if r["rc"] != 0 and "already" not in out.lower():
+        hint = ""
+        if "0x2006" in out or "Internal Error" in out:
+            hint = (" - the drive wants a power cycle first: unplug it and plug it back in, "
+                    "then press the button again")
+        return finish(False, f"attach-ns failed: {out[:200]}{hint}")
+    nvme(["ns-rescan", f"/dev/{ctrl}"], timeout=60)
+
+    phase("verify")
+    found = None
+    for _ in range(15):
+        time.sleep(1)
+        found = (namespaces(ctrl) or [None])[0]
+        if found:
+            break
+    u["state_after"] = namespace_state(ctrl)
+    u["namespace"] = found
+    if not found:
+        return finish(False, "the namespace was attached but no block device appeared "
+                             "(try a re-scan or a power cycle)")
+    size = ns_size_bytes(ctrl)
+    u["size_bytes"] = size
+    ro_flag = rd(f"/sys/block/{found}/ro")
+    say(f"/dev/{found} is there: {gb(size):.1f} GB, read-only flag {ro_flag}",
+        "OK" if ro_flag == "0" else "WARN")
+    if ro_flag != "0":
+        return finish(False, f"/dev/{found} came back read-only - the drive is still locked")
+    phase("verify", "done")
+    say(f"the drive has a usable namespace again: /dev/{found} ({gb(size):.1f} GB). "
+        f"It can be tested.", "OK")
+    return finish(True)
+
+
+def cmd_namespace(args):
+    """Attach or create the namespace of a drive that has none."""
+    results = Path(args.results)
+    results.mkdir(parents=True, exist_ok=True)
+    log = Log(results)
+    preflight(args, log)
+    ci = next((c for c in controllers(("pcie",)) if c["ctrl"] == args.ctrl), None)
+    if not ci:
+        sys.exit(f"{args.ctrl} not found")
+    log.set_drive(None, f"[{ci['ctrl']} {ci['serial']}] ")
+    u = namespace_fix(results, ci, log, nsid=args.nsid, block_size=args.block_size, nsze=args.nsze)
+    return 0 if u.get("ok") else 2
+
+
 def cmd_report(args):
     results = Path(args.results)
     runs = {}
@@ -2433,7 +2639,7 @@ def cmd_watch(args):
             "The kernel parameters do not apply to these (re-plugging is recommended).", "WARN")
     pci_baseline = set(nvme_pci_devices()) if "pcie" in transports else set()
     handled, waiting_since, dead_done, announced = set(), {}, set(), set()
-    last_recovery, last_unlock = None, None
+    last_recovery, last_unlock, last_namespace = None, None, None
     for f in (results / REQ_DIR).glob("*.json") if (results / REQ_DIR).is_dir() else []:
         f.unlink(missing_ok=True)  # stale requests from an earlier run
     for c in present.values():
@@ -2504,10 +2710,6 @@ def cmd_watch(args):
                     continue
                 key = (c["ctrl"], c["serial"])
                 if req.get("action") == "unlock":
-                    if req.get("confirm") != c["serial"]:
-                        log(f"unlock request for {c['ctrl']} ignored: the confirmation does not "
-                            f"match the serial number ({who})", "WARN")
-                        continue
                     log(f"UNLOCK requested for {c['ctrl']} (S/N {c['serial']}) by {who} "
                         f"- THIS ERASES THE DRIVE", "WARN")
                     rows = [drive_info(results, x) for x in now.values()]
@@ -2531,6 +2733,24 @@ def cmd_watch(args):
                     present.pop(c["ctrl"], None)
                     handled.discard((c["ctrl"], c["serial"]))
                     announced.discard((c["ctrl"], c["serial"]))
+                    idle_msg = time.time()
+                    continue
+                if req.get("action") == "namespace":
+                    log(f"NAMESPACE FIX requested for {c['ctrl']} (S/N {c['serial']}) by {who}")
+                    rows = [drive_info(results, x) for x in now.values()]
+
+                    def publish_ns(u, rows=rows):
+                        write_status(results, running=False, waiting=True, busy="namespace",
+                                     mode="auto" if args.auto else "manual", drives=rows,
+                                     last_recovery=last_recovery, namespace=u)
+
+                    try:
+                        last_namespace = namespace_fix(results, c, log, publish=publish_ns)
+                    except Exception as ex:  # noqa: BLE001
+                        last_namespace = {"ok": False, "running": False, "ctrl": c["ctrl"],
+                                          "serial": c["serial"],
+                                          "error": f"{type(ex).__name__}: {ex}"}
+                        log(f"the namespace fix failed: {last_namespace['error']}", "ERR")
                     idle_msg = time.time()
                     continue
                 if req.get("action") == "recover":
@@ -2580,7 +2800,8 @@ def cmd_watch(args):
                 log("waiting for a drive ... (summary report: radtest.py report)")
             write_status(results, running=False, waiting=True, mode="auto" if args.auto else "manual",
                          drives=[drive_info(results, c) for c in now.values()],
-                         last_recovery=last_recovery, unlock=last_unlock)
+                         last_recovery=last_recovery, unlock=last_unlock,
+                         namespace=last_namespace)
             time.sleep(2)
     except KeyboardInterrupt:
         log("watcher stopped")
@@ -2718,6 +2939,14 @@ def main():
     p.add_argument("--no-switch-reset", action="store_true",
                    help="never hard-reset the switch (it disturbs every drive behind it)")
     p.set_defaults(func=cmd_unlock)
+    p = sub.add_parser("namespace", help="drive without a usable namespace: attach the one it "
+                                        "has, or create one")
+    p.add_argument("ctrl", help="e.g. nvme0")
+    p.add_argument("--nsid", type=int, help="namespace to attach (default: the detached one)")
+    p.add_argument("--block-size", type=int, default=None, help="block size when creating (4096)")
+    p.add_argument("--nsze", type=int, default=None, help="size in blocks when creating "
+                                                          "(default: the whole free capacity)")
+    p.set_defaults(func=cmd_namespace)
     p = sub.add_parser("status", help="state of the running test")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("report", help="summary report")

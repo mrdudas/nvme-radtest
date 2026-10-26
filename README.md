@@ -13,6 +13,7 @@ make                           # build bin/nvblk (once)
 ./radtest.py status            # from another terminal: where the test currently is
 ./radtest.py report            # once every drive is done: results/REPORT.{txt,md,csv}
 ./radtest.py unlock nvme0      # read-only Micron drive: unlock it (ERASES THE DRIVE)
+./radtest.py namespace nvme0   # drive without a namespace: attach the one it has, or create one
 ./radtest.py run nvme0         # test one drive directly, without the watcher
 ./radtest.py watch --auto      # old behaviour: test every inserted drive immediately
 ```
@@ -44,8 +45,9 @@ run it with `--read-only` if that is not acceptable.
 - **Live test:** when idle, the detected drives with their Start buttons (model, serial, size, and
   whether they were tested before); while a test runs, drive data, state of the 11 steps, progress
   bar, throughput, remaining time, error counters, live latency chart, log. A drive that came back
-  locked gets **Unlock…** and **Check only** instead of Start, and the unlock reports its progress
-  on the page, phase by phase.
+  locked gets **Unlock…** and **Check only** instead of Start, one without a usable namespace gets
+  **Attach namespace** / **Create namespace**, and both report their progress on the page, phase by
+  phase.
   Nothing on the page is redrawn on a whole: the status is polled every two seconds, but only the
   fields that actually changed are rewritten, so selection, hover and scrolling are never lost.
 - **Drives:** the runs are grouped by serial number, one row per physical drive, showing its latest
@@ -104,7 +106,7 @@ and needs a reset deeper than a controller reset. radtest can do all of it, so n
 ```
 
 In the web UI a locked drive shows **Unlock…** and **Check only** instead of Start. Unlock asks for
-the drive's serial number to be typed back, and then runs:
+a confirmation and then runs:
 
 | # | Phase | What happens |
 |---|---|---|
@@ -118,6 +120,25 @@ the drive's serial number to be typed back, and then runs:
 The drive's controller name may change along the way (the reset re-enumerates it); the drive is
 followed by serial number. The progress, every message and the result appear on the page while it
 runs, and are saved into `unlock.json` next to the evidence.
+
+### A drive without a namespace
+
+An interrupted unlock leaves the drive in a half-recovered state: the erase is done and the lock is
+gone, but the namespace is still detached, so there is no block device and nothing can be tested.
+Such a drive shows **no namespace** in the list with an **Attach namespace** button (or **Create
+namespace** when the drive has none allocated at all):
+
+```bash
+./radtest.py namespace nvme0            # attach what is there, or create one over the free capacity
+./radtest.py namespace nvme0 --nsid 1   # a particular namespace
+./radtest.py namespace nvme0 --block-size 4096 --nsze 107216896
+```
+
+It first reads what the drive actually has (`list-ns`, `list-ns -a`, `list-ctrl`, `id-ctrl`):
+a namespace that is allocated but detached is simply attached (`attach-ns` + `ns-rescan`) - nothing
+is created and nothing is erased. Only when the controller reports no allocated namespace at all
+does it create one, over the free capacity, with 4 KiB blocks. If the drive answers `0x2006`, it
+says so and asks for a power cycle, because that is what the firmware wants at that point.
 
 It never runs the irreversible commands (`msecli -M -L`, `msecli -X -P`, permanent write protect,
 firmware download/commit) - those are listed on the page as the ones never to use.

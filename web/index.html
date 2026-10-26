@@ -60,7 +60,7 @@ button.danger:hover { filter: brightness(1.08); }
 .steps li.failed .ic { background: var(--bad-soft); color: var(--bad); }
 .steps li.failed { color: var(--bad); }
 .steps li.skipped { color: var(--muted); opacity: .55; }
-#unlockPanel .card { max-width: 1000px; margin: 0 auto; }
+#unlockPanel .card, #nsPanel .card { max-width: 1000px; margin: 0 auto; }
 main { max-width: 1400px; margin: 0 auto; padding: 20px; }
 .grid { display: grid; gap: 16px; }
 .cols-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
@@ -178,6 +178,7 @@ button.del:hover { color: var(--bad); }
         <div id="startMsg"></div>
       </div>
       <div id="unlockPanel" style="margin-top:18px;text-align:left"></div>
+      <div id="nsPanel" style="margin-top:18px;text-align:left"></div>
       <div id="recovery" style="margin-top:18px;text-align:left"></div>
       <div id="idleLast" style="margin-top:18px"></div>
     </div>
@@ -463,6 +464,7 @@ async function renderIdle(s, st) {
     : "Insert an NVMe drive, then press Start on it below.");
   renderDetected(st.drives || [], s.allow_start !== false, auto);
   renderUnlock(st.unlock);
+  renderUnlock(st.namespace, "#nsPanel", "Namespace");
   renderRecovery(st.last_recovery);
   if (Date.now() - lastIdleFetch > 15000) {
     lastIdleFetch = Date.now();
@@ -559,6 +561,10 @@ function renderDetected(drives, allowStart, auto) {
     const note = busy ? `<span class="pill bad">in use: ${esc(busy)}</span>`
       : ro ? `<span class="pill bad">read-only (Micron firmware lock)</span>
           <span class="muted note">Unlock erases the whole drive; Check only looks and saves</span>`
+      : d.no_namespace ? `<span class="pill warn">no namespace</span>
+          <span class="muted note">${d.ns_detached && d.ns_detached.length
+            ? "namespace " + d.ns_detached.join(", ") + " is there but detached – attaching it erases nothing"
+            : "the drive has no namespace at all – one can be created over the whole capacity"}</span>`
       : d.tested ? `<span class="pill ${VCLS[d.last_verdict] || ""}">tested · ${esc(VSHORT[d.last_verdict] || "?")}</span>
           <span class="muted note">${esc((d.last_run || "").replace("T", " ").slice(0, 16))}</span>`
       : `<span class="pill">not tested yet</span>`;
@@ -566,10 +572,12 @@ function renderDetected(drives, allowStart, auto) {
       { t: gb(d.size_bytes), cls: "num" }, d.state, { h: note }, null]);
     // the action cell is only rebuilt when the offered action changes, so a
     // button that was pressed stays disabled until the drive's state moves on
-    const kind = !allowStart ? "ro-ui" : auto ? "auto" : !live ? "state" : busy ? "busy" : ro ? "locked" : "start";
+    const kind = !allowStart ? "ro-ui" : auto ? "auto" : !live ? "state" : busy ? "busy"
+      : ro ? "locked" : d.no_namespace ? "nons" : "start";
     const label = kind === "start" ? (d.tested ? "Test again" : "Start test") : "";
     const cell = tr.lastElementChild;
-    const sig = [kind, label, d.ctrl, d.serial, d.model, d.state, gb(d.size_bytes), d.tested ? 1 : 0].join("|");
+    const sig = [kind, label, d.ctrl, d.serial, d.model, d.state, gb(d.size_bytes),
+      d.tested ? 1 : 0, (d.ns_detached || []).join(",")].join("|");
     if (cell._sig === sig) return;
     cell._sig = sig; cell.innerHTML = "";
     const data = { ctrl: d.ctrl, serial: d.serial, model: d.model, gb: gb(d.size_bytes) };
@@ -581,6 +589,12 @@ function renderDetected(drives, allowStart, auto) {
       Object.assign(ch.dataset, data); ch.onclick = () => recoverDrive(ch);
       ch.style.marginLeft = "6px";
       cell.append(un, ch);
+    } else if (kind === "nons") {
+      const b = mk("button", "primary");
+      b.textContent = (d.ns_detached && d.ns_detached.length) ? "Attach namespace" : "Create namespace";
+      Object.assign(b.dataset, data, { detached: (d.ns_detached || []).join(",") });
+      b.onclick = () => fixNamespace(b);
+      cell.appendChild(b);
     } else if (kind === "start") {
       const b = mk("button", d.tested ? "" : "primary");
       b.textContent = label;
@@ -619,22 +633,19 @@ async function recoverDrive(btn) {
 
 async function unlockDrive(btn) {
   const d = btn.dataset;
-  const typed = prompt(`${d.model} (S/N ${d.serial}) is locked by its own firmware.\n\n` +
-    `UNLOCKING ERASES THE WHOLE DRIVE: block erase, reset, namespace attached again. ` +
-    `Everything the erase would destroy (telemetry, persistent event log, SMART, vendor logs) is ` +
-    `saved first, and it stops by itself if the drive turns out to be failing.\n\n` +
-    `The drive is then reset: first its own PCIe port, and if that is not deep enough, the whole ` +
-    `PCIe switch (every drive behind it blinks out for a moment). If even that is not enough, it ` +
-    `asks you to unplug the drive and plug it back in.\n\n` +
-    `Type the serial number to confirm:`);
-  if (typed == null) return;
-  if (typed.trim() !== d.serial) { alert("The serial number does not match – nothing was done."); return; }
+  if (!confirm(`${d.model} (S/N ${d.serial}) is locked by its own firmware.\n\n` +
+      `UNLOCKING ERASES THE WHOLE DRIVE: block erase, reset, namespace attached again. ` +
+      `Everything the erase would destroy (telemetry, persistent event log, SMART, vendor logs) is ` +
+      `saved first, and it stops by itself if the drive turns out to be failing.\n\n` +
+      `The drive is then reset: first its own PCIe port, and if that is not deep enough, the whole ` +
+      `PCIe switch (every drive behind it blinks out for a moment). If even that is not enough, it ` +
+      `asks you to unplug the drive and plug it back in.\n\nStart the unlock?`)) return;
   btn.disabled = true;
   const msg = $("#startMsg");
   msg.textContent = "Unlock requested…"; msg.style.color = "var(--muted)";
   try {
     const r = await fetch("/api/unlock", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial, confirm: typed.trim() }) });
+      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial }) });
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
     msg.textContent = "Unlocking – the progress appears below.";
@@ -646,67 +657,73 @@ async function unlockDrive(btn) {
   }
 }
 
+async function fixNamespace(btn) {
+  const d = btn.dataset, has = !!d.detached;
+  if (!confirm(`${d.model} (S/N ${d.serial}) has no usable namespace.\n\n` +
+      (has ? `Namespace ${d.detached} is on the drive, only detached. Attaching it creates nothing ` +
+             `and erases nothing – the drive becomes visible again as a block device.`
+           : `The drive has no namespace at all. A new one is created over the whole free capacity ` +
+             `(4 KiB blocks) and attached. No user data is written.`) + `\n\nGo ahead?`)) return;
+  btn.disabled = true;
+  const msg = $("#startMsg");
+  msg.textContent = has ? "Attaching the namespace…" : "Creating the namespace…";
+  msg.style.color = "var(--muted)";
+  try {
+    const r = await fetch("/api/namespace", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ctrl: d.ctrl, serial: d.serial }) });
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+    msg.textContent = "Running – the progress appears below.";
+  } catch (e) {
+    msg.textContent = "Could not start: " + e.message;
+    msg.style.color = "var(--bad)";
+    btn.disabled = false;
+  }
+}
+
 const UL_SKEL = `<div class="card" style="text-align:left">
   <div class="row" style="justify-content:space-between">
-    <h2 style="margin:0">Micron unlock</h2>
-    <span class="pill" id="ulPill"><span class="dot"></span><span></span></span></div>
-  <div id="ulHead" class="muted mono" style="margin-top:4px"></div>
-  <ul class="steps" id="ulPhases" style="margin-top:10px"></ul>
-  <div class="bar hidden" id="ulBarWrap" style="margin-top:10px"><div id="ulBar" style="width:0"></div></div>
-  <div id="ulMsg" style="margin-top:10px;font-weight:600"></div>
-  <div class="log" id="ulLog" style="height:150px;margin-top:10px"></div>
-  <div class="muted" id="ulFoot" style="margin-top:8px"></div></div>`;
+    <h2 style="margin:0" class="ul-title"></h2>
+    <span class="pill ul-pill"><span class="dot"></span><span></span></span></div>
+  <div class="muted mono ul-head" style="margin-top:4px"></div>
+  <ul class="steps ul-phases" style="margin-top:10px"></ul>
+  <div class="bar hidden ul-barwrap" style="margin-top:10px"><div class="ul-bar" style="width:0"></div></div>
+  <div class="ul-msg" style="margin-top:10px;font-weight:600"></div>
+  <div class="log ul-log" style="height:150px;margin-top:10px"></div>
+  <div class="muted ul-foot" style="margin-top:8px"></div></div>`;
 
-function renderUnlock(u) {
-  const box = $("#unlockPanel");
+// one renderer for both long running recoveries: the unlock and the namespace fix
+function renderUnlock(u, sel = "#unlockPanel", title = "Micron unlock") {
+  const box = $(sel);
   if (!u) { if (box._built) { box.innerHTML = ""; box._built = 0; } return; }
   if (!box._built) { box.innerHTML = UL_SKEL; box._built = 1; }
-  const pill = $("#ulPill"), run = !!u.running;
-  setCls(pill, "pill " + (run ? "run" : u.ok ? "ok" : "bad"));
-  setText(pill.lastElementChild, run ? "unlocking…" : u.ok ? "unlocked" : "failed");
-  setText($("#ulHead"), `${u.model || ""} · ${u.ctrl} · S/N ${u.serial} · started ${(u.started || "").replace("T", " ")}` +
+  const q = c => $("." + c, box);
+  setText(q("ul-title"), title);
+  const pill = q("ul-pill"), run = !!u.running;
+  setCls(pill, "pill ul-pill " + (run ? "run" : u.ok ? "ok" : "bad"));
+  setText(pill.lastElementChild, run ? "running…" : u.ok ? "done" : "failed");
+  setText(q("ul-head"), `${u.model || ""} · ${u.ctrl} · S/N ${u.serial} · started ${(u.started || "").replace("T", " ")}` +
     (u.finished ? ` · finished ${u.finished.slice(11)}` : ""));
-  syncList($("#ulPhases"), u.phases || [], x => x.n,
+  syncList(q("ul-phases"), u.phases || [], x => x.n,
     () => { const li = mk("li"); li.append(mk("span", "ic"), mk("span"), mk("span", "d")); return li; },
     (li, x) => { setCls(li, x.state);
       setText(li.children[0], x.state === "done" ? "✓" : x.state === "failed" ? "✕" : x.n);
       setText(li.children[1], x.name);
       setText(li.children[2], x.pct != null && x.state === "running" ? x.pct + "%" : (x.msg || "")); });
-  const er = (u.phases || []).find(x => x.name === "erase" && x.pct != null && x.state === "running");
-  $("#ulBarWrap").classList.toggle("hidden", !er);
-  if (er) { const w = er.pct + "%"; if ($("#ulBar").style.width !== w) $("#ulBar").style.width = w; }
-  const msg = $("#ulMsg");
-  setText(msg, u.error || u.note || (u.ok ? `Unlocked – /dev/${u.namespace || "?"} takes writes again, the drive is empty.` : ""));
-  setCls(msg, u.error ? "nz" : "");
-  syncList($("#ulLog"), (u.messages || []).map((m, i) => ({ ...m, i })), m => m.i, () => mk("div"),
+  const er = (u.phases || []).find(x => x.pct != null && x.state === "running");
+  q("ul-barwrap").classList.toggle("hidden", !er);
+  if (er) { const w = er.pct + "%"; if (q("ul-bar").style.width !== w) q("ul-bar").style.width = w; }
+  const msg = q("ul-msg");
+  setText(msg, u.error || u.note || (u.ok && u.namespace ? `Done – /dev/${u.namespace} is usable again.` : ""));
+  setCls(msg, "ul-msg " + (u.error ? "nz" : ""));
+  syncList(q("ul-log"), (u.messages || []).map((m, i) => ({ ...m, i })), m => m.i, () => mk("div"),
     (el, m) => { setCls(el, m.level === "ERR" ? "e" : m.level === "WARN" ? "w" : m.level === "OK" ? "o" : "");
       setText(el, `${m.t}  ${m.msg}`); });
-  const lg = $("#ulLog"); lg.scrollTop = lg.scrollHeight;
+  const lg = q("ul-log"); lg.scrollTop = lg.scrollHeight;
   const pc = u.power_cycle || {};
-  setHTML($("#ulFoot"), [u.dir ? `saved evidence: <a href="/files/${encodeURI(u.dir)}/recovery.json" target="_blank"><code>${esc(u.dir)}</code></a>` : "",
-    pc.method ? `reset: ${esc(pc.method)}` : "", u.write_test ? "write test passed" : ""].filter(Boolean).join(" · "));
-}
-
-function renderRecovery(rec) {
-  const box = $("#recovery");
-  if (!rec) { setHTML(box, ""); return; }
-  const when = (rec.finished || rec.started || "").replace("T", " ").slice(0, 16);
-  if (rec.error && !rec.ok) {
-    setHTML(box, `<div class="card" style="text-align:left"><h2>Micron recovery check</h2>
-      <div><b>${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b> <span class="muted">${esc(when)}</span></div>
-      <div class="${rec.not_locked ? "" : "nz"}" style="margin-top:6px">${esc(rec.error)}</div></div>`);
-    return;
-  }
-  setHTML(box, `<div class="card" style="text-align:left">
-    <h2>Micron recovery – manual steps</h2>
-    <div><b>${esc(rec.model || "")} · ${esc(rec.ctrl)} · S/N ${esc(rec.serial)}</b>
-      <span class="muted">checked ${esc(when)}</span></div>
-    <div style="margin-top:8px">Everything the erase would destroy is saved:
-      <a href="/files/${encodeURI(rec.dir || "")}/recovery.json" target="_blank"><code>${esc(rec.dir || rec.saved_to || "")}</code></a></div>
-    <div class="warnbox">These steps <b>erase the whole drive</b> – run them yourself, in this order:</div>
-    <ol class="steps-ol">${(rec.steps || []).map(x => `<li><code>${esc(x)}</code></li>`).join("")}</ol>
-    <div class="muted">Never run: ${(rec.forbidden || []).map(x => `<code>${esc(x)}</code>`).join(", ")}
-      – those are irreversible.</div></div>`);
+  setHTML(q("ul-foot"), [u.dir ? `saved evidence: <a href="/files/${encodeURI(u.dir)}/recovery.json" target="_blank"><code>${esc(u.dir)}</code></a>` : "",
+    pc.method ? `reset: ${esc(pc.method)}` : "", u.write_test ? "write test passed" : "",
+    u.size_bytes ? `${gb(u.size_bytes)} GB` : ""].filter(Boolean).join(" · "));
 }
 
 async function startTest(btn) {
